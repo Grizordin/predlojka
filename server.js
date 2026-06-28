@@ -681,6 +681,26 @@ async function updateTask(taskKeyValue, patch) {
   );
 }
 
+async function cleanupStaleReplacementTasks(activeTaskKeys) {
+  const keys = [...new Set(activeTaskKeys)].filter(Boolean);
+  let where = `type = 'replacement' AND status IN ('pending', 'checking') AND author IS NULL`;
+  const params = [];
+  if (keys.length) {
+    where += ` AND task_key NOT IN (${keys.map(() => '?').join(',')})`;
+    params.push(...keys);
+  }
+  const before = await d1.query(`SELECT COUNT(*) AS count FROM tasks WHERE ${where}`, params);
+  await d1.query(`DELETE FROM tasks WHERE ${where}`, params);
+  const deleted = Number(before[0]?.count || 0);
+  if (deleted) {
+    await logEvent('info', 'cleanup-replacements', 'stale replacement tasks deleted', {
+      active: keys.length,
+      deleted
+    });
+  }
+  return deleted;
+}
+
 async function getResults(keys) {
   if (!keys.length) return [];
   const placeholders = keys.map(() => '?').join(',');
@@ -776,17 +796,23 @@ async function monitorCardsPage() {
   for (const replacement of parsed.replacements) {
     await upsertTask('replacement', replacement);
   }
+  const activeReplacementKeys = parsed.replacements.map(replacement =>
+    taskKey('replacement', replacement.cardId, replacement.newImage || replacement.image || '')
+  );
+  const staleReplacementsDeleted = await cleanupStaleReplacementTasks(activeReplacementKeys);
 
   await logEvent('info', 'cards-monitor', 'cards page parsed', {
     addedCards: parsed.addedCards.length,
     replacements: parsed.replacements.length,
-    visibleAuthors: parsed.visibleAuthors.length
+    visibleAuthors: parsed.visibleAuthors.length,
+    staleReplacementsDeleted
   });
   return {
     ok: true,
     addedCards: parsed.addedCards.length,
     replacements: parsed.replacements.length,
-    visibleAuthors: parsed.visibleAuthors.length
+    visibleAuthors: parsed.visibleAuthors.length,
+    staleReplacementsDeleted
   };
 }
 
