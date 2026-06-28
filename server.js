@@ -417,10 +417,9 @@ function parseCardsPage(html, baseUrl) {
 }
 
 function parseAddedCards($, baseUrl) {
-  const blocks = $('.anime-cards-center.anime-cards--full-page[data-suite-vote-block="1"], .anime-cards-center.anime-cards--full-page')
+  const blocks = $('.anime-cards-center.anime-cards--full-page[data-suite-vote-block="1"]')
     .filter((_, section) => $(section).find('.card-votes').length > 0 && $(section).find('.card-replace-vote').length === 0);
-  const scope = blocks.length ? blocks : $.root();
-  return scope.find('.anime-cards__item[data-id]').toArray()
+  return blocks.find('.anime-cards__item[data-id]').toArray()
     .map(node => cardFromNode($, node, baseUrl))
     .filter(card => card.cardId && card.image);
 }
@@ -650,7 +649,7 @@ async function upsertTask(type, data) {
   await d1.query(
     `INSERT INTO tasks(task_key, type, card_id, image, status, created_at, updated_at)
      VALUES(?, ?, ?, ?, 'pending', ?, ?)
-     ON CONFLICT(task_key) DO UPDATE SET updated_at = excluded.updated_at`,
+     ON CONFLICT(task_key) DO NOTHING`,
     [key, type, data.cardId, data.newImage || data.image || '', now, now]
   );
   return key;
@@ -659,7 +658,7 @@ async function upsertTask(type, data) {
 async function getPendingTasks(limit = 10) {
   return d1.query(
     `SELECT * FROM tasks WHERE status IN ('pending', 'checking')
-     ORDER BY CASE type WHEN 'created' THEN 1 WHEN 'replacement' THEN 2 ELSE 3 END, updated_at ASC
+     ORDER BY CASE type WHEN 'replacement' THEN 1 WHEN 'created' THEN 2 ELSE 3 END, updated_at ASC
      LIMIT ?`,
     [limit]
   );
@@ -1000,6 +999,33 @@ app.post('/api/admin/monitor-cards', async (request, reply) => {
   if (reply.sent) return;
   await monitorCardsPage();
   return { ok: true };
+});
+
+app.post('/api/admin/cleanup-created-tasks', async (request, reply) => {
+  requireAdmin(request, reply);
+  if (reply.sent) return;
+  const belowId = Number(request.body?.belowId || request.query?.belowId || 90000);
+  const before = await d1.query(
+    `SELECT COUNT(*) AS count FROM tasks
+     WHERE type = 'created'
+       AND status IN ('pending', 'checking')
+       AND author IS NULL
+       AND CAST(card_id AS INTEGER) < ?`,
+    [belowId]
+  );
+  await d1.query(
+    `DELETE FROM tasks
+     WHERE type = 'created'
+       AND status IN ('pending', 'checking')
+       AND author IS NULL
+       AND CAST(card_id AS INTEGER) < ?`,
+    [belowId]
+  );
+  await logEvent('info', 'cleanup-created-tasks', 'old created pending tasks deleted', {
+    belowId,
+    deleted: Number(before[0]?.count || 0)
+  });
+  return { ok: true, belowId, deleted: Number(before[0]?.count || 0) };
 });
 
 app.post('/api/admin/check-suggestions', async (request, reply) => {
