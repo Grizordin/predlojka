@@ -492,6 +492,39 @@ async function logEvent(level, scope, message, data = null) {
   );
 }
 
+async function getActivity({ sinceMs = nowMs() - 60 * 60 * 1000, limit = 50 } = {}) {
+  const logs = await d1.query(
+    `SELECT level, scope, message, data_json, created_at
+     FROM logs
+     WHERE created_at >= ?
+     ORDER BY created_at DESC
+     LIMIT ?`,
+    [sinceMs, limit]
+  );
+  const taskSummary = await d1.query(
+    `SELECT type, status, COUNT(*) AS count
+     FROM tasks
+     GROUP BY type, status
+     ORDER BY type, status`
+  );
+  const recentTasks = await d1.query(
+    `SELECT task_key, type, card_id, image, status, author, last_error, updated_at
+     FROM tasks
+     WHERE updated_at >= ?
+     ORDER BY updated_at DESC
+     LIMIT ?`,
+    [sinceMs, limit]
+  );
+  const pendingTasks = await d1.query(
+    `SELECT task_key, type, card_id, image, status, author, last_error, updated_at
+     FROM tasks
+     WHERE status IN ('pending', 'checking')
+     ORDER BY updated_at ASC
+     LIMIT 20`
+  );
+  return { logs, taskSummary, recentTasks, pendingTasks };
+}
+
 async function upsertAuthor(name, patch = {}) {
   const key = authorKey(name);
   if (!key) return;
@@ -674,35 +707,56 @@ async function getSuggestions({ rank = '', limit = 60, offset = 0 }) {
 
 // ===== src/scheduler.js =====
 let tickRunning = false;
+let currentTickStep = 'idle';
+let lastTickStatus = { ok: true, running: false, message: 'not started', updatedAt: 0 };
+
+async function timedStep(timings, name, fn) {
+  const startedAt = nowMs();
+  currentTickStep = name;
+  try {
+    return await fn();
+  } finally {
+    timings[name] = nowMs() - startedAt;
+  }
+}
 
 async function runTick({ budgetMs = config.tickBudgetMs } = {}) {
   if (tickRunning) return { ok: true, running: true, skipped: true };
   tickRunning = true;
   const startedAt = nowMs();
+  const timings = {};
+  lastTickStatus = { ok: true, running: true, step: currentTickStep, startedAt, updatedAt: startedAt };
   const stats = { cardsMonitor: false, tasksProcessed: 0, suggestionAuthors: 0, inactiveChecked: 0 };
   try {
-    await monitorCardsPage();
-    stats.cardsMonitor = true;
+    stats.cardsMonitor = await timedStep(timings, 'monitorCardsPage', () => monitorCardsPage());
+
+    const firstTask = await timedStep(timings, 'processOneAuthorshipTask:first', () => processOneAuthorshipTask());
+    if (firstTask) stats.tasksProcessed += 1;
 
     while (nowMs() - startedAt < budgetMs) {
-      const didTask = await processOneAuthorshipTask();
+      const didTask = await timedStep(timings, 'processOneAuthorshipTask:loop', () => processOneAuthorshipTask());
       if (didTask) {
         stats.tasksProcessed += 1;
         continue;
       }
-      const didSuggestion = await processSuggestionAuthors(1);
+      const didSuggestion = await timedStep(timings, 'processSuggestionAuthors', () => processSuggestionAuthors(1));
       if (didSuggestion) {
         stats.suggestionAuthors += didSuggestion;
         continue;
       }
       break;
     }
-    return { ok: true, running: false, elapsedMs: nowMs() - startedAt, ...stats };
+    const result = { ok: true, running: false, elapsedMs: nowMs() - startedAt, timings, ...stats };
+    lastTickStatus = { ...result, updatedAt: nowMs() };
+    return result;
   } catch (error) {
     await logEvent('error', 'tick', error.message, { stack: error.stack });
-    return { ok: false, error: error.message, ...stats };
+    const result = { ok: false, running: false, step: currentTickStep, error: error.message, timings, ...stats };
+    lastTickStatus = { ...result, updatedAt: nowMs() };
+    return result;
   } finally {
     tickRunning = false;
+    currentTickStep = 'idle';
   }
 }
 
@@ -729,6 +783,12 @@ async function monitorCardsPage() {
     replacements: parsed.replacements.length,
     visibleAuthors: parsed.visibleAuthors.length
   });
+  return {
+    ok: true,
+    addedCards: parsed.addedCards.length,
+    replacements: parsed.replacements.length,
+    visibleAuthors: parsed.visibleAuthors.length
+  };
 }
 
 async function processOneAuthorshipTask() {
@@ -870,7 +930,34 @@ app.get('/health', async () => ({ ok: true, service: 'anime-cards-server' }));
 
 app.get('/api/tick', async request => {
   const budgetMs = Number(request.query?.budgetMs || config.tickBudgetMs);
-  return runTick({ budgetMs });
+  const wait = String(request.query?.wait || '') === '1';
+  if (wait) return runTick({ budgetMs });
+  const wasRunning = tickRunning;
+  if (!wasRunning) {
+    runTick({ budgetMs }).catch(error => {
+      lastTickStatus = { ok: false, running: false, error: error.message, updatedAt: nowMs() };
+      console.error('[tick]', error);
+    });
+  }
+  return { ok: true, started: !wasRunning, running: true, lastTickStatus };
+});
+
+app.get('/api/tick-status', async () => {
+  return { ok: true, running: tickRunning, currentTickStep, lastTickStatus };
+});
+
+app.get('/api/activity', async request => {
+  const hours = Math.min(Math.max(Number(request.query?.hours || 1), 0.1), 24);
+  const limit = Math.min(Math.max(Number(request.query?.limit || 50), 1), 200);
+  const activity = await getActivity({ sinceMs: nowMs() - hours * 60 * 60 * 1000, limit });
+  return {
+    ok: true,
+    running: tickRunning,
+    currentTickStep,
+    lastTickStatus,
+    hours,
+    ...activity
+  };
 });
 
 app.post('/api/admin/migrate', async (request, reply) => {
