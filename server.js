@@ -86,6 +86,21 @@ function taskKey(type, cardId, image = '') {
   return String(cardId || '');
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`request timeout after ${timeoutMs}ms: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ===== src/d1.js =====
 function assertD1Config() {
   const missing = [];
@@ -104,14 +119,14 @@ class D1Client {
 
   async query(sql, params = []) {
     assertD1Config();
-    const response = await fetch(this.endpoint, {
+    const response = await fetchWithTimeout(this.endpoint, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${config.cloudflare.apiToken}`,
         'content-type': 'application/json'
       },
       body: JSON.stringify({ sql, params })
-    });
+    }, 15000);
     const json = await response.json().catch(() => null);
     if (!response.ok || !json?.success) {
       throw new Error(`D1 query failed ${response.status}: ${JSON.stringify(json)}`);
@@ -258,10 +273,10 @@ class AnimeSSSClient {
     const loginUrl = `${origin}/`;
 
     await this.waitSlot();
-    const initialResponse = await fetch(loginUrl, {
+    const initialResponse = await fetchWithTimeout(loginUrl, {
       headers: REQUEST_HEADERS,
       redirect: 'manual'
-    });
+    }, 15000);
     const initialCookie = mergeCookieHeaders(cookiePairsFromSetCookie(readSetCookie(initialResponse.headers)));
 
     const body = new URLSearchParams({
@@ -273,7 +288,7 @@ class AnimeSSSClient {
     }
 
     await this.waitSlot();
-    const loginResponse = await fetch(loginUrl, {
+    const loginResponse = await fetchWithTimeout(loginUrl, {
       method: 'POST',
       redirect: 'manual',
       headers: {
@@ -284,7 +299,7 @@ class AnimeSSSClient {
         ...(initialCookie ? { cookie: initialCookie } : {})
       },
       body: body.toString()
-    });
+    }, 15000);
 
     const loginCookie = mergeCookieHeaders(cookiePairsFromSetCookie(readSetCookie(loginResponse.headers)));
     const cookie = mergeCookieHeaders(initialCookie, loginCookie);
@@ -300,13 +315,13 @@ class AnimeSSSClient {
     const cookie = await this.loginToOrigin(origin);
 
     await this.waitSlot();
-    const response = await fetch(`${origin}${path}`, {
+    const response = await fetchWithTimeout(`${origin}${path}`, {
       headers: {
         ...REQUEST_HEADERS,
         accept: 'text/html,application/xhtml+xml',
         ...(cookie ? { cookie } : {})
       }
-    });
+    }, 15000);
 
     const nextCookie = mergeCookieHeaders(cookie, cookiePairsFromSetCookie(readSetCookie(response.headers)));
     if (nextCookie) this.cookieByOrigin.set(origin, nextCookie);
