@@ -187,12 +187,12 @@ function mergeCookieHeaders(...cookieHeaders) {
 }
 
 function looksLikeLoginPage(html) {
-  return html.includes('Р РµРіРёСЃС‚СЂР°С†РёСЏ РїРѕСЃРµС‚РёС‚РµР»СЏ')
+  return html.includes('Регистрация посетителя')
+    || html.includes('Авторизация')
+    || html.includes('Для просмотра данной страницы нужно авторизоваться')
+    || html.includes('Р РµРіРёСЃС‚СЂР°С†РёСЏ РїРѕСЃРµС‚РёС‚РµР»СЏ')
     || html.includes('РђРІС‚РѕСЂРёР·Р°С†РёСЏ')
-    || html.includes('Р”Р»СЏ РїСЂРѕСЃРјРѕС‚СЂР° РґР°РЅРЅРѕР№ СЃС‚СЂР°РЅРёС†С‹ РЅСѓР¶РЅРѕ Р°РІС‚РѕСЂРёР·РѕРІР°С‚СЊСЃСЏ')
-    || html.includes('Р В Р ВµР С–Р С‘РЎРѓРЎвЂљРЎР‚Р В°РЎвЂ Р С‘РЎРЏ Р С—Р С•РЎРѓР ВµРЎвЂљР С‘РЎвЂљР ВµР В»РЎРЏ')
-    || html.includes('Р С’Р Р†РЎвЂљР С•РЎР‚Р С‘Р В·Р В°РЎвЂ Р С‘РЎРЏ')
-    || html.includes('Р вЂќР В»РЎРЏ Р С—РЎР‚Р С•РЎРѓР СР С•РЎвЂљРЎР‚Р В°')
+    || html.includes('Р”Р»СЏ РїСЂРѕСЃРјРѕС‚СЂР°')
     || (html.includes('login_name') && html.includes('login_password') && !html.includes('/index.php?action=logout'));
 }
 
@@ -386,8 +386,8 @@ function parseCreatedCount(html) {
   const $ = cheerio.load(html || '');
   const text = $('.ncard__main-title, h1').toArray()
     .map(node => $(node).text())
-    .find(value => /РљР°СЂС‚РѕС‡РєРё\s+СЃРѕР·РґР°РЅРЅС‹Рµ\s+РїРѕР»СЊР·РѕРІР°С‚РµР»РµРј|Р С™Р В°РЎР‚РЎвЂљР С•РЎвЂЎР С”Р С‘\s+РЎРѓР С•Р В·Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р Вµ/i.test(value)) || $.text();
-  const match = String(text || '').match(/\(([\d\s]+)\s*(?:С€С‚\.|РЎв‚¬РЎвЂљ\.)\)/i);
+    .find(value => /Карточки\s+созданные\s+пользователем|РљР°СЂС‚РѕС‡РєРё\s+СЃРѕР·РґР°РЅРЅС‹Рµ/i.test(value)) || $.text();
+  const match = String(text || '').match(/\(([\d\s]+)\s*(?:шт\.|С€С‚\.)\)/i);
   return match ? Number(match[1].replace(/\s+/g, '')) : 0;
 }
 
@@ -395,15 +395,15 @@ function parseProfileOnlineText(html) {
   const $ = cheerio.load(html || '');
   const line = $('.usn__info-line').toArray()
     .map(node => $(node).text().replace(/\s+/g, ' ').trim())
-    .find(text => /^Р’ СЃРµС‚Рё:|^Р вЂ™\s+РЎРѓР ВµРЎвЂљР С‘:/i.test(text));
+    .find(text => /^В сети:|^Р’\s+СЃРµС‚Рё:/i.test(text));
   return line || '';
 }
 
 function isMoreThanMonthOffline(onlineText) {
   const text = String(onlineText || '').toLowerCase();
   if (!text) return false;
-  if (/РіРѕРґ|Р»РµС‚|Р С–Р С•Р Т‘|Р В»Р ВµРЎвЂљ/.test(text)) return true;
-  if (/РјРµСЃСЏС†|Р СР ВµРЎРѓРЎРЏРЎвЂ /.test(text)) return true;
+  if (/год|лет|РіРѕРґ|Р»РµС‚/.test(text)) return true;
+  if (/месяц|РјРµСЃСЏС†/.test(text)) return true;
   return false;
 }
 
@@ -412,16 +412,55 @@ function parseCardsPage(html, baseUrl) {
   return {
     addedCards: parseAddedCards($, baseUrl),
     replacements: parseReplacementVotes($, baseUrl),
-    visibleAuthors: parseVisibleCatalogAuthors($)
+    visibleAuthors: parseVisibleCatalogAuthors($),
+    addedDebug: parseAddedCardsDebug($)
   };
 }
 
 function parseAddedCards($, baseUrl) {
-  const blocks = $('.anime-cards-center.anime-cards--full-page[data-suite-vote-block="1"]')
-    .filter((_, section) => $(section).find('.card-votes').length > 0 && $(section).find('.card-replace-vote').length === 0);
-  return blocks.find('.anime-cards__item[data-id]').toArray()
-    .map(node => cardFromNode($, node, baseUrl))
-    .filter(card => card.cardId && card.image);
+  const cards = [];
+  const seen = new Set();
+  $('.anime-cards__item-wrapper-gl,.anime-cards__item-wrapper').each((_, wrapperNode) => {
+    const wrapper = $(wrapperNode);
+    if (wrapper.closest('.cards-replace-vote-list,.card-replace-vote').length) return;
+    if (!wrapper.find('.card-votes').length) return;
+    if (wrapper.find('.card-votes__btn[data-kind="1"],.card-votes button[data-kind="1"]').length) return;
+    if (!wrapper.find('.card-votes__btn[data-kind="0"],.card-votes button[data-kind="0"]').length) return;
+    const cardNode = wrapper.find('.anime-cards__item[data-id]').first();
+    const card = cardNode.length ? cardFromNode($, cardNode[0], baseUrl) : null;
+    if (!card?.cardId || !card.image || seen.has(card.cardId)) return;
+    seen.add(card.cardId);
+    cards.push(card);
+  });
+  return cards;
+}
+
+function parseAddedCardsDebug($) {
+  const voteBlocks = $('.anime-cards-center.anime-cards--full-page')
+    .filter((_, section) => $(section).find('.card-votes').length > 0 && $(section).find('.card-replace-vote').length === 0)
+    .length;
+  const voteWrappers = $('.anime-cards__item-wrapper-gl,.anime-cards__item-wrapper')
+    .filter((_, wrapperNode) => {
+      const wrapper = $(wrapperNode);
+      if (wrapper.closest('.cards-replace-vote-list,.card-replace-vote').length) return false;
+      if (!wrapper.find('.card-votes').length) return false;
+      if (wrapper.find('.card-votes__btn[data-kind="1"],.card-votes button[data-kind="1"]').length) return false;
+      return wrapper.find('.card-votes__btn[data-kind="0"],.card-votes button[data-kind="0"]').length > 0;
+    })
+    .length;
+  const firstIds = $('.anime-cards__item-wrapper-gl,.anime-cards__item-wrapper')
+    .filter((_, wrapperNode) => {
+      const wrapper = $(wrapperNode);
+      if (wrapper.closest('.cards-replace-vote-list,.card-replace-vote').length) return false;
+      if (!wrapper.find('.card-votes').length) return false;
+      return wrapper.find('.card-votes__btn[data-kind="0"],.card-votes button[data-kind="0"]').length > 0;
+    })
+    .find('.anime-cards__item[data-id]')
+    .toArray()
+    .slice(0, 10)
+    .map(node => String($(node).attr('data-id') || ''))
+    .filter(Boolean);
+  return { voteBlocks, voteWrappers, firstIds };
 }
 
 function parseReplacementVotes($, baseUrl) {
@@ -805,14 +844,16 @@ async function monitorCardsPage() {
     addedCards: parsed.addedCards.length,
     replacements: parsed.replacements.length,
     visibleAuthors: parsed.visibleAuthors.length,
-    staleReplacementsDeleted
+    staleReplacementsDeleted,
+    addedDebug: parsed.addedDebug
   });
   return {
     ok: true,
     addedCards: parsed.addedCards.length,
     replacements: parsed.replacements.length,
     visibleAuthors: parsed.visibleAuthors.length,
-    staleReplacementsDeleted
+    staleReplacementsDeleted,
+    addedDebug: parsed.addedDebug
   };
 }
 
