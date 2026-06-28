@@ -187,12 +187,12 @@ function mergeCookieHeaders(...cookieHeaders) {
 }
 
 function looksLikeLoginPage(html) {
-  return html.includes('Регистрация посетителя')
-    || html.includes('Авторизация')
-    || html.includes('Для просмотра данной страницы нужно авторизоваться')
-    || html.includes('Р РµРіРёСЃС‚СЂР°С†РёСЏ РїРѕСЃРµС‚РёС‚РµР»СЏ')
+  return html.includes('Р РµРіРёСЃС‚СЂР°С†РёСЏ РїРѕСЃРµС‚РёС‚РµР»СЏ')
     || html.includes('РђРІС‚РѕСЂРёР·Р°С†РёСЏ')
-    || html.includes('Р”Р»СЏ РїСЂРѕСЃРјРѕС‚СЂР°')
+    || html.includes('Р”Р»СЏ РїСЂРѕСЃРјРѕС‚СЂР° РґР°РЅРЅРѕР№ СЃС‚СЂР°РЅРёС†С‹ РЅСѓР¶РЅРѕ Р°РІС‚РѕСЂРёР·РѕРІР°С‚СЊСЃСЏ')
+    || html.includes('Р В Р ВµР С–Р С‘РЎРѓРЎвЂљРЎР‚Р В°РЎвЂ Р С‘РЎРЏ Р С—Р С•РЎРѓР ВµРЎвЂљР С‘РЎвЂљР ВµР В»РЎРЏ')
+    || html.includes('Р С’Р Р†РЎвЂљР С•РЎР‚Р С‘Р В·Р В°РЎвЂ Р С‘РЎРЏ')
+    || html.includes('Р вЂќР В»РЎРЏ Р С—РЎР‚Р С•РЎРѓР СР С•РЎвЂљРЎР‚Р В°')
     || (html.includes('login_name') && html.includes('login_password') && !html.includes('/index.php?action=logout'));
 }
 
@@ -386,8 +386,8 @@ function parseCreatedCount(html) {
   const $ = cheerio.load(html || '');
   const text = $('.ncard__main-title, h1').toArray()
     .map(node => $(node).text())
-    .find(value => /Карточки\s+созданные\s+пользователем|РљР°СЂС‚РѕС‡РєРё\s+СЃРѕР·РґР°РЅРЅС‹Рµ/i.test(value)) || $.text();
-  const match = String(text || '').match(/\(([\d\s]+)\s*(?:шт\.|С€С‚\.)\)/i);
+    .find(value => /РљР°СЂС‚РѕС‡РєРё\s+СЃРѕР·РґР°РЅРЅС‹Рµ\s+РїРѕР»СЊР·РѕРІР°С‚РµР»РµРј|Р С™Р В°РЎР‚РЎвЂљР С•РЎвЂЎР С”Р С‘\s+РЎРѓР С•Р В·Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р Вµ/i.test(value)) || $.text();
+  const match = String(text || '').match(/\(([\d\s]+)\s*(?:С€С‚\.|РЎв‚¬РЎвЂљ\.)\)/i);
   return match ? Number(match[1].replace(/\s+/g, '')) : 0;
 }
 
@@ -395,15 +395,15 @@ function parseProfileOnlineText(html) {
   const $ = cheerio.load(html || '');
   const line = $('.usn__info-line').toArray()
     .map(node => $(node).text().replace(/\s+/g, ' ').trim())
-    .find(text => /^В сети:|^Р’\s+СЃРµС‚Рё:/i.test(text));
+    .find(text => /^Р’ СЃРµС‚Рё:|^Р вЂ™\s+РЎРѓР ВµРЎвЂљР С‘:/i.test(text));
   return line || '';
 }
 
 function isMoreThanMonthOffline(onlineText) {
   const text = String(onlineText || '').toLowerCase();
   if (!text) return false;
-  if (/год|лет|РіРѕРґ|Р»РµС‚/.test(text)) return true;
-  if (/месяц|РјРµСЃСЏС†/.test(text)) return true;
+  if (/РіРѕРґ|Р»РµС‚|Р С–Р С•Р Т‘|Р В»Р ВµРЎвЂљ/.test(text)) return true;
+  if (/РјРµСЃСЏС†|Р СР ВµРЎРѓРЎРЏРЎвЂ /.test(text)) return true;
   return false;
 }
 
@@ -926,6 +926,14 @@ async function checkInactiveAuthors(limit = 20) {
 const app = Fastify({ logger: true });
 await app.register(cors, { origin: true });
 
+app.get('/', async () => ({
+  ok: true,
+  service: 'anime-cards-server',
+  running: tickRunning,
+  currentTickStep,
+  lastTickStatus
+}));
+
 app.get('/health', async () => ({ ok: true, service: 'anime-cards-server' }));
 
 app.get('/api/tick', async request => {
@@ -1038,5 +1046,21 @@ app.get('/api/rank', async request => {
   );
   return { ok: true, rows };
 });
+
+function startAutoTick() {
+  const intervalMs = Math.max(config.cardsMonitorIntervalMs, 10000);
+  const run = () => {
+    if (tickRunning) return;
+    runTick({ budgetMs: config.tickBudgetMs }).catch(error => {
+      lastTickStatus = { ok: false, running: false, error: error.message, updatedAt: nowMs() };
+      console.error('[auto-tick]', error);
+    });
+  };
+  setTimeout(run, 5000);
+  setInterval(run, intervalMs);
+  console.log(`[auto-tick] enabled, interval ${intervalMs}ms`);
+}
+
+startAutoTick();
 
 app.listen({ port: config.port, host: '0.0.0.0' });
