@@ -31,7 +31,10 @@ const config = {
   inactiveScanIntervalMs: Number(process.env.INACTIVE_SCAN_INTERVAL_MS || 86400000),
   suggestionRatedIntervalMs: Number(process.env.SUGGESTION_RATED_INTERVAL_MS || 600000),
   suggestionZeroIntervalMs: Number(process.env.SUGGESTION_ZERO_INTERVAL_MS || 1800000),
-  suggestionDecayDays: Number(process.env.SUGGESTION_DECAY_DAYS || 7)
+  suggestionDecayDays: Number(process.env.SUGGESTION_DECAY_DAYS || 7),
+  runtimeCheckpointIntervalMs: Number(process.env.RUNTIME_CHECKPOINT_INTERVAL_MS || 300000),
+  logRetentionDays: Number(process.env.LOG_RETENTION_DAYS || 7),
+  runtimeLogLimit: Number(process.env.RUNTIME_LOG_LIMIT || 500)
 };
 
 function requireAdmin(request, reply) {
@@ -519,218 +522,497 @@ function parseReplacementPage(html, baseUrl) {
 }
 
 // ===== src/db.js =====
+const runtime = {
+  loaded: false,
+  loading: null,
+  authors: new Map(),
+  cards: new Map(),
+  suggestions: new Map(),
+  suggestionsByAuthor: new Map(),
+  tasks: new Map(),
+  logs: [],
+  dirtyTaskKeys: new Set(),
+  checkpointDirty: false,
+  checkpointVersion: 0,
+  lastCheckpointAt: 0,
+  lastLogCleanupAt: 0
+};
+
+function numberValue(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function safeJsonArray(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function chunks(items, size = 50) {
+  const result = [];
+  for (let index = 0; index < items.length; index += size) {
+    result.push(items.slice(index, index + size));
+  }
+  return result;
+}
+
+function sameFields(left, right, fields) {
+  return fields.every(field => (left?.[field] ?? null) === (right?.[field] ?? null));
+}
+
+function runtimeStats() {
+  return {
+    loaded: runtime.loaded,
+    authors: runtime.authors.size,
+    cards: runtime.cards.size,
+    suggestions: runtime.suggestions.size,
+    tasks: runtime.tasks.size,
+    dirtyTasks: runtime.dirtyTaskKeys.size,
+    lastCheckpointAt: runtime.lastCheckpointAt
+  };
+}
+
+function addSuggestionToAuthorIndex(row) {
+  const key = authorKey(row.author);
+  if (!key) return;
+  if (!runtime.suggestionsByAuthor.has(key)) runtime.suggestionsByAuthor.set(key, new Set());
+  runtime.suggestionsByAuthor.get(key).add(String(row.card_id));
+}
+
+function hydrateRuntime(authors, cards, suggestions, tasks, checkpointRows, logs) {
+  runtime.authors.clear();
+  runtime.cards.clear();
+  runtime.suggestions.clear();
+  runtime.suggestionsByAuthor.clear();
+  runtime.tasks.clear();
+  runtime.dirtyTaskKeys.clear();
+  runtime.checkpointDirty = false;
+  runtime.checkpointVersion = 0;
+
+  for (const row of authors) runtime.authors.set(row.author_key, { ...row });
+  for (const row of cards) runtime.cards.set(String(row.card_id), { ...row });
+  for (const row of suggestions) {
+    const normalized = { ...row, card_id: String(row.card_id) };
+    runtime.suggestions.set(normalized.card_id, normalized);
+    addSuggestionToAuthorIndex(normalized);
+  }
+  for (const row of tasks) runtime.tasks.set(row.task_key, { ...row });
+
+  try {
+    const checkpoint = JSON.parse(checkpointRows[0]?.value || '{}');
+    for (const item of checkpoint.authors || []) {
+      const row = runtime.authors.get(item[0]);
+      if (!row) continue;
+      row.last_suggestion_checked_at = numberValue(item[1], row.last_suggestion_checked_at);
+      row.last_profile_checked_at = numberValue(item[2], row.last_profile_checked_at);
+    }
+    runtime.lastCheckpointAt = numberValue(checkpointRows[0]?.updated_at);
+  } catch (error) {
+    console.warn('[runtime-cache] ignored invalid checkpoint:', error.message);
+  }
+
+  runtime.logs = logs.map(row => ({ ...row })).slice(0, config.runtimeLogLimit);
+  runtime.loaded = true;
+  console.log(
+    `[runtime-cache] loaded ${runtime.authors.size} authors, ${runtime.cards.size} cards, ` +
+    `${runtime.suggestions.size} suggestions, ${runtime.tasks.size} tasks`
+  );
+}
+
+async function ensureRuntimeState() {
+  if (runtime.loaded) return;
+  if (runtime.loading) return runtime.loading;
+  runtime.loading = (async () => {
+    const [authors, cards, suggestions, tasks, checkpointRows, logs] = await Promise.all([
+      d1.query('SELECT * FROM authors'),
+      d1.query('SELECT * FROM cards'),
+      d1.query('SELECT * FROM suggestions'),
+      d1.query('SELECT * FROM tasks'),
+      d1.query("SELECT value, updated_at FROM settings WHERE key = 'runtime_checkpoint_v1'"),
+      d1.query(
+        `SELECT level, scope, message, data_json, created_at
+         FROM logs ORDER BY created_at DESC LIMIT ?`,
+        [config.runtimeLogLimit]
+      )
+    ]);
+    hydrateRuntime(authors, cards, suggestions, tasks, checkpointRows, logs);
+  })();
+  try {
+    await runtime.loading;
+  } catch (error) {
+    runtime.loaded = false;
+    throw error;
+  } finally {
+    runtime.loading = null;
+  }
+}
+
 async function migrate(schemaSql) {
   await d1.exec(schemaSql);
 }
 
 async function logEvent(level, scope, message, data = null) {
-  await d1.query(
-    'INSERT INTO logs(level, scope, message, data_json, created_at) VALUES(?, ?, ?, ?, ?)',
-    [level, scope, message, data ? JSON.stringify(data) : null, nowMs()]
-  );
+  const row = {
+    level,
+    scope,
+    message,
+    data_json: data ? JSON.stringify(data) : null,
+    created_at: nowMs()
+  };
+  runtime.logs.unshift(row);
+  if (runtime.logs.length > config.runtimeLogLimit) runtime.logs.length = config.runtimeLogLimit;
+  if (level === 'warn' || level === 'error') {
+    try {
+      await d1.query(
+        'INSERT INTO logs(level, scope, message, data_json, created_at) VALUES(?, ?, ?, ?, ?)',
+        [row.level, row.scope, row.message, row.data_json, row.created_at]
+      );
+    } catch (error) {
+      console.error(`[log:${scope}] failed to persist:`, error.message);
+    }
+  }
 }
 
 async function getActivity({ sinceMs = nowMs() - 60 * 60 * 1000, limit = 50 } = {}) {
-  const logs = await d1.query(
-    `SELECT level, scope, message, data_json, created_at
-     FROM logs
-     WHERE created_at >= ?
-     ORDER BY created_at DESC
-     LIMIT ?`,
-    [sinceMs, limit]
-  );
-  const taskSummary = await d1.query(
-    `SELECT type, status, COUNT(*) AS count
-     FROM tasks
-     GROUP BY type, status
-     ORDER BY type, status`
-  );
-  const recentTasks = await d1.query(
-    `SELECT task_key, type, card_id, image, status, author, last_error, updated_at
-     FROM tasks
-     WHERE updated_at >= ?
-     ORDER BY updated_at DESC
-     LIMIT ?`,
-    [sinceMs, limit]
-  );
-  const pendingTasks = await d1.query(
-    `SELECT task_key, type, card_id, image, status, author, last_error, updated_at
-     FROM tasks
-     WHERE status IN ('pending', 'checking')
-     ORDER BY updated_at ASC
-     LIMIT 20`
-  );
+  await ensureRuntimeState();
+  const logs = runtime.logs.filter(row => numberValue(row.created_at) >= sinceMs).slice(0, limit);
+  const summary = new Map();
+  const allTasks = [...runtime.tasks.values()];
+  for (const task of allTasks) {
+    const key = `${task.type}|${task.status}`;
+    summary.set(key, (summary.get(key) || 0) + 1);
+  }
+  const taskSummary = [...summary.entries()]
+    .map(([key, count]) => {
+      const [type, status] = key.split('|');
+      return { type, status, count };
+    })
+    .sort((a, b) => a.type.localeCompare(b.type) || a.status.localeCompare(b.status));
+  const recentTasks = allTasks
+    .filter(row => numberValue(row.updated_at) >= sinceMs)
+    .sort((a, b) => numberValue(b.updated_at) - numberValue(a.updated_at))
+    .slice(0, limit);
+  const pendingTasks = allTasks
+    .filter(row => row.status === 'pending' || row.status === 'checking')
+    .sort((a, b) => numberValue(a.updated_at) - numberValue(b.updated_at))
+    .slice(0, 20);
   return { logs, taskSummary, recentTasks, pendingTasks };
 }
 
 async function upsertAuthor(name, patch = {}) {
+  await ensureRuntimeState();
   const key = authorKey(name);
   if (!key) return;
-  const current = await d1.query('SELECT * FROM authors WHERE author_key = ?', [key]);
-  const row = current[0] || {};
+  const current = runtime.authors.get(key);
+  const row = {
+    author_key: key,
+    name: patch.name || current?.name || name,
+    created_score: patch.createdScore ?? current?.created_score ?? 0,
+    replacement_score: patch.replacementScore ?? current?.replacement_score ?? 0,
+    suggestion_score: patch.suggestionScore ?? current?.suggestion_score ?? 0,
+    inactive: patch.inactive ?? current?.inactive ?? 0,
+    last_profile_checked_at: patch.lastProfileCheckedAt ?? current?.last_profile_checked_at ?? 0,
+    last_suggestion_checked_at: patch.lastSuggestionCheckedAt ?? current?.last_suggestion_checked_at ?? 0,
+    last_suggestion_found_at: patch.lastSuggestionFoundAt ?? current?.last_suggestion_found_at ?? 0,
+    created_count: patch.createdCount ?? current?.created_count ?? null,
+    updated_at: current?.updated_at ?? nowMs()
+  };
+  const durableFields = [
+    'name', 'created_score', 'replacement_score', 'suggestion_score',
+    'inactive', 'last_suggestion_found_at', 'created_count'
+  ];
+  const durableChanged = !current || !sameFields(current, row, durableFields);
+  if (patch.lastProfileCheckedAt != null || patch.lastSuggestionCheckedAt != null) {
+    runtime.checkpointDirty = true;
+    runtime.checkpointVersion += 1;
+  }
+  if (!durableChanged) {
+    runtime.authors.set(key, row);
+    return row;
+  }
+
+  row.updated_at = nowMs();
   await d1.query(
-    `INSERT OR REPLACE INTO authors(
+    `INSERT INTO authors(
       author_key, name, created_score, replacement_score, suggestion_score, inactive,
       last_profile_checked_at, last_suggestion_checked_at, last_suggestion_found_at,
       created_count, updated_at
-    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(author_key) DO UPDATE SET
+      name = excluded.name,
+      created_score = excluded.created_score,
+      replacement_score = excluded.replacement_score,
+      suggestion_score = excluded.suggestion_score,
+      inactive = excluded.inactive,
+      last_suggestion_found_at = excluded.last_suggestion_found_at,
+      created_count = excluded.created_count,
+      updated_at = excluded.updated_at`,
     [
-      key,
-      patch.name || row.name || name,
-      patch.createdScore ?? row.created_score ?? 0,
-      patch.replacementScore ?? row.replacement_score ?? 0,
-      patch.suggestionScore ?? row.suggestion_score ?? 0,
-      patch.inactive ?? row.inactive ?? 0,
-      patch.lastProfileCheckedAt ?? row.last_profile_checked_at ?? 0,
-      patch.lastSuggestionCheckedAt ?? row.last_suggestion_checked_at ?? 0,
-      patch.lastSuggestionFoundAt ?? row.last_suggestion_found_at ?? 0,
-      patch.createdCount ?? row.created_count ?? null,
-      nowMs()
+      key, row.name, row.created_score, row.replacement_score, row.suggestion_score,
+      row.inactive, row.last_profile_checked_at, row.last_suggestion_checked_at,
+      row.last_suggestion_found_at, row.created_count, row.updated_at
     ]
   );
+  runtime.authors.set(key, row);
+  return row;
 }
 
 async function bumpAuthorScore(name, type, amount = 1) {
   await upsertAuthor(name);
   const column = type === 'created' ? 'created_score' : type === 'replacement' ? 'replacement_score' : 'suggestion_score';
-  await d1.query(`UPDATE authors SET ${column} = ${column} + ?, updated_at = ? WHERE author_key = ?`, [amount, nowMs(), authorKey(name)]);
+  const key = authorKey(name);
+  const row = runtime.authors.get(key);
+  const nextScore = numberValue(row[column]) + amount;
+  const updatedAt = nowMs();
+  await d1.query(`UPDATE authors SET ${column} = ?, updated_at = ? WHERE author_key = ?`, [nextScore, updatedAt, key]);
+  row[column] = nextScore;
+  row.updated_at = updatedAt;
 }
 
 async function getAuthorsForAuthorship(type, checkedKeys = []) {
-  const rows = await d1.query(
-    `SELECT * FROM authors
-     ORDER BY ${type === 'created' ? 'created_score' : 'replacement_score'} DESC, name COLLATE NOCASE ASC`
+  await ensureRuntimeState();
+  const scoreField = type === 'created' ? 'created_score' : 'replacement_score';
+  const rows = [...runtime.authors.values()].sort(
+    (a, b) => numberValue(b[scoreField]) - numberValue(a[scoreField]) || a.name.localeCompare(b.name, 'ru')
   );
   const checked = new Set(checkedKeys);
   return rows.filter(row => !checked.has(row.author_key));
 }
 
 async function getAuthorsForSuggestions(limit = 50, now = nowMs(), ratedIntervalMs, zeroIntervalMs) {
-  return d1.query(
-    `SELECT * FROM authors
-     WHERE inactive = 0
-       AND (
-         (suggestion_score > 0 AND last_suggestion_checked_at <= ?)
-         OR
-         (suggestion_score <= 0 AND last_suggestion_checked_at <= ?)
-       )
-     ORDER BY suggestion_score DESC, last_suggestion_checked_at ASC, name COLLATE NOCASE ASC
-     LIMIT ?`,
-    [now - ratedIntervalMs, now - zeroIntervalMs, limit]
-  );
+  await ensureRuntimeState();
+  return [...runtime.authors.values()]
+    .filter(row => {
+      if (numberValue(row.inactive) !== 0) return false;
+      const interval = numberValue(row.suggestion_score) > 0 ? ratedIntervalMs : zeroIntervalMs;
+      return numberValue(row.last_suggestion_checked_at) <= now - interval;
+    })
+    .sort((a, b) =>
+      numberValue(b.suggestion_score) - numberValue(a.suggestion_score) ||
+      numberValue(a.last_suggestion_checked_at) - numberValue(b.last_suggestion_checked_at) ||
+      a.name.localeCompare(b.name, 'ru')
+    )
+    .slice(0, limit);
 }
 
 async function upsertCard(card, source, author = card.author || null) {
+  await ensureRuntimeState();
   const now = nowMs();
-  const current = await d1.query('SELECT * FROM cards WHERE card_id = ?', [card.cardId]);
-  const row = current[0] || {};
+  const cardId = String(card.cardId);
+  const current = runtime.cards.get(cardId);
+  const row = {
+    card_id: cardId,
+    author: author || current?.author || null,
+    name: card.name || current?.name || null,
+    rank: card.rank || current?.rank || null,
+    image: card.image || current?.image || null,
+    image_url: card.imageUrl || current?.image_url || null,
+    anime_name: card.animeName || current?.anime_name || null,
+    anime_link: card.animeLink || current?.anime_link || null,
+    first_seen_source: current?.first_seen_source || source,
+    seen_in_suggestion: source === 'suggestion' ? 1 : numberValue(current?.seen_in_suggestion),
+    seen_on_cards_page: source === 'cards_added' ? 1 : numberValue(current?.seen_on_cards_page),
+    last_seen_suggestion_at: source === 'suggestion' ? now : numberValue(current?.last_seen_suggestion_at),
+    last_seen_cards_at: source === 'cards_added' ? now : numberValue(current?.last_seen_cards_at),
+    updated_at: current?.updated_at ?? now
+  };
+  const durableFields = [
+    'author', 'name', 'rank', 'image', 'image_url', 'anime_name', 'anime_link',
+    'first_seen_source', 'seen_in_suggestion', 'seen_on_cards_page'
+  ];
+  const changed = !current || !sameFields(current, row, durableFields);
+  if (!changed) {
+    runtime.cards.set(cardId, row);
+    return false;
+  }
+  row.updated_at = now;
   await d1.query(
-    `INSERT OR REPLACE INTO cards(
+    `INSERT INTO cards(
       card_id, author, name, rank, image, image_url, anime_name, anime_link, first_seen_source,
       seen_in_suggestion, seen_on_cards_page, last_seen_suggestion_at, last_seen_cards_at, updated_at
-    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(card_id) DO UPDATE SET
+      author = excluded.author, name = excluded.name, rank = excluded.rank,
+      image = excluded.image, image_url = excluded.image_url,
+      anime_name = excluded.anime_name, anime_link = excluded.anime_link,
+      seen_in_suggestion = excluded.seen_in_suggestion,
+      seen_on_cards_page = excluded.seen_on_cards_page,
+      last_seen_suggestion_at = excluded.last_seen_suggestion_at,
+      last_seen_cards_at = excluded.last_seen_cards_at,
+      updated_at = excluded.updated_at`,
     [
-      card.cardId,
-      author || row.author || null,
-      card.name || row.name || null,
-      card.rank || row.rank || null,
-      card.image || row.image || null,
-      card.imageUrl || row.image_url || null,
-      card.animeName || row.anime_name || null,
-      card.animeLink || row.anime_link || null,
-      row.first_seen_source || source,
-      source === 'suggestion' ? 1 : row.seen_in_suggestion || 0,
-      source === 'cards_added' ? 1 : row.seen_on_cards_page || 0,
-      source === 'suggestion' ? now : row.last_seen_suggestion_at || 0,
-      source === 'cards_added' ? now : row.last_seen_cards_at || 0,
-      now
+      row.card_id, row.author, row.name, row.rank, row.image, row.image_url,
+      row.anime_name, row.anime_link, row.first_seen_source,
+      row.seen_in_suggestion, row.seen_on_cards_page,
+      row.last_seen_suggestion_at, row.last_seen_cards_at, row.updated_at
     ]
   );
+  runtime.cards.set(cardId, row);
+  return true;
 }
 
 async function upsertSuggestion(card, author) {
-  const existed = await d1.query('SELECT card_id FROM suggestions WHERE card_id = ?', [card.cardId]);
+  await ensureRuntimeState();
+  const cardId = String(card.cardId);
+  const current = runtime.suggestions.get(cardId);
+  const now = nowMs();
   await upsertCard(card, 'suggestion', author);
+  const row = {
+    card_id: cardId,
+    author,
+    name: card.name || current?.name || null,
+    rank: card.rank || current?.rank || null,
+    image: card.image || current?.image || null,
+    image_url: card.imageUrl || current?.image_url || null,
+    anime_name: card.animeName || current?.anime_name || null,
+    anime_link: card.animeLink || current?.anime_link || null,
+    active: 1,
+    detected_at: current?.detected_at ?? now,
+    last_seen_at: now
+  };
+  const durableFields = ['author', 'name', 'rank', 'image', 'image_url', 'anime_name', 'anime_link', 'active'];
+  const changed = !current || !sameFields(current, row, durableFields);
+  if (!changed) {
+    runtime.suggestions.set(cardId, row);
+    return false;
+  }
   await d1.query(
-    `INSERT OR REPLACE INTO suggestions(
+    `INSERT INTO suggestions(
       card_id, author, name, rank, image, image_url, anime_name, anime_link, active, detected_at, last_seen_at
-    ) VALUES(
-      ?, ?, ?, ?, ?, ?, ?, ?, 1,
-      COALESCE((SELECT detected_at FROM suggestions WHERE card_id = ?), ?),
-      ?
-    )`,
+    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(card_id) DO UPDATE SET
+      author = excluded.author, name = excluded.name, rank = excluded.rank,
+      image = excluded.image, image_url = excluded.image_url,
+      anime_name = excluded.anime_name, anime_link = excluded.anime_link,
+      active = excluded.active, last_seen_at = excluded.last_seen_at`,
     [
-      card.cardId, author, card.name, card.rank, card.image, card.imageUrl,
-      card.animeName, card.animeLink, card.cardId, nowMs(), nowMs()
+      row.card_id, row.author, row.name, row.rank, row.image, row.image_url,
+      row.anime_name, row.anime_link, row.active, row.detected_at, row.last_seen_at
     ]
   );
-  return existed.length === 0;
+  if (current && authorKey(current.author) !== authorKey(row.author)) {
+    runtime.suggestionsByAuthor.get(authorKey(current.author))?.delete(cardId);
+  }
+  runtime.suggestions.set(cardId, row);
+  addSuggestionToAuthorIndex(row);
+  return !current;
 }
 
 async function deactivateMissingSuggestions(author, activeCardIds) {
-  const placeholders = activeCardIds.map(() => '?').join(',');
-  const params = [authorKey(author)];
-  const rows = await d1.query('SELECT name FROM authors WHERE author_key = ?', params);
-  const displayName = rows[0]?.name || author;
-  if (!activeCardIds.length) {
-    await d1.query('UPDATE suggestions SET active = 0 WHERE author = ?', [displayName]);
-    return;
+  await ensureRuntimeState();
+  const active = new Set(activeCardIds.map(String));
+  const authorSuggestions = runtime.suggestionsByAuthor.get(authorKey(author)) || new Set();
+  const missing = [...authorSuggestions].filter(cardId => {
+    const row = runtime.suggestions.get(cardId);
+    return row && numberValue(row.active) === 1 && !active.has(cardId);
+  });
+  if (!missing.length) return 0;
+  for (const batch of chunks(missing)) {
+    await d1.query(
+      `UPDATE suggestions SET active = 0 WHERE active = 1 AND card_id IN (${batch.map(() => '?').join(',')})`,
+      batch
+    );
+    for (const cardId of batch) runtime.suggestions.get(cardId).active = 0;
   }
-  await d1.query(
-    `UPDATE suggestions SET active = 0 WHERE author = ? AND card_id NOT IN (${placeholders})`,
-    [displayName, ...activeCardIds]
-  );
+  return missing.length;
 }
 
 async function upsertTask(type, data) {
+  await ensureRuntimeState();
   const key = taskKey(type, data.cardId, data.newImage || data.image || '');
+  if (runtime.tasks.has(key)) return key;
   const now = nowMs();
+  const row = {
+    task_key: key,
+    type,
+    card_id: String(data.cardId),
+    image: data.newImage || data.image || '',
+    status: 'pending',
+    author: null,
+    checked_authors_json: '[]',
+    last_error: null,
+    created_at: now,
+    updated_at: now
+  };
   await d1.query(
     `INSERT INTO tasks(task_key, type, card_id, image, status, created_at, updated_at)
      VALUES(?, ?, ?, ?, 'pending', ?, ?)
      ON CONFLICT(task_key) DO NOTHING`,
-    [key, type, data.cardId, data.newImage || data.image || '', now, now]
+    [key, type, row.card_id, row.image, now, now]
   );
+  runtime.tasks.set(key, row);
   return key;
 }
 
 async function getPendingTasks(limit = 10) {
-  return d1.query(
-    `SELECT * FROM tasks WHERE status IN ('pending', 'checking')
-     ORDER BY CASE type WHEN 'replacement' THEN 1 WHEN 'created' THEN 2 ELSE 3 END, updated_at ASC
-     LIMIT ?`,
-    [limit]
+  await ensureRuntimeState();
+  const typeOrder = { replacement: 1, created: 2 };
+  return [...runtime.tasks.values()]
+    .filter(row => row.status === 'pending' || row.status === 'checking')
+    .sort((a, b) =>
+      (typeOrder[a.type] || 3) - (typeOrder[b.type] || 3) ||
+      numberValue(a.updated_at) - numberValue(b.updated_at)
+    )
+    .slice(0, limit);
+}
+
+async function persistTask(row) {
+  await d1.query(
+    `UPDATE tasks SET status = ?, author = ?, checked_authors_json = ?, last_error = ?, updated_at = ?
+     WHERE task_key = ?`,
+    [row.status, row.author, row.checked_authors_json, row.last_error, row.updated_at, row.task_key]
   );
+  if (runtime.tasks.get(row.task_key) === row) runtime.dirtyTaskKeys.delete(row.task_key);
 }
 
 async function updateTask(taskKeyValue, patch) {
-  const current = await d1.query('SELECT * FROM tasks WHERE task_key = ?', [taskKeyValue]);
-  const row = current[0];
-  if (!row) return;
-  await d1.query(
-    `UPDATE tasks SET status = ?, author = ?, checked_authors_json = ?, last_error = ?, updated_at = ? WHERE task_key = ?`,
-    [
-      patch.status ?? row.status,
-      patch.author ?? row.author,
-      patch.checkedAuthorsJson ?? row.checked_authors_json ?? '[]',
-      patch.lastError ?? row.last_error,
-      nowMs(),
-      taskKeyValue
-    ]
-  );
+  await ensureRuntimeState();
+  const current = runtime.tasks.get(taskKeyValue);
+  if (!current) return;
+  const row = {
+    ...current,
+    status: patch.status ?? current.status,
+    author: patch.author ?? current.author,
+    checked_authors_json: patch.checkedAuthorsJson ?? current.checked_authors_json ?? '[]',
+    last_error: patch.lastError ?? current.last_error,
+    updated_at: nowMs()
+  };
+  const changed = !sameFields(current, row, ['status', 'author', 'checked_authors_json', 'last_error']);
+  if (!changed) return;
+  runtime.tasks.set(taskKeyValue, row);
+  runtime.dirtyTaskKeys.add(taskKeyValue);
+  const terminal = row.status === 'found' || row.status === 'not_found';
+  const important = terminal || current.status !== row.status || current.author !== row.author || current.last_error !== row.last_error;
+  if (important) await persistTask(row);
 }
 
 async function cleanupStaleReplacementTasks(activeTaskKeys) {
+  await ensureRuntimeState();
   const keys = [...new Set(activeTaskKeys)].filter(Boolean);
-  let where = `type = 'replacement' AND status IN ('pending', 'checking') AND author IS NULL`;
-  const params = [];
-  if (keys.length) {
-    where += ` AND task_key NOT IN (${keys.map(() => '?').join(',')})`;
-    params.push(...keys);
+  const active = new Set(keys);
+  const stale = [...runtime.tasks.values()].filter(row =>
+    row.type === 'replacement' &&
+    (row.status === 'pending' || row.status === 'checking') &&
+    !row.author &&
+    !active.has(row.task_key)
+  );
+  if (stale.length) {
+    for (const batch of chunks(stale)) {
+      await d1.query(
+        `DELETE FROM tasks WHERE task_key IN (${batch.map(() => '?').join(',')})`,
+        batch.map(row => row.task_key)
+      );
+      for (const row of batch) {
+        runtime.tasks.delete(row.task_key);
+        runtime.dirtyTaskKeys.delete(row.task_key);
+      }
+    }
   }
-  const before = await d1.query(`SELECT COUNT(*) AS count FROM tasks WHERE ${where}`, params);
-  await d1.query(`DELETE FROM tasks WHERE ${where}`, params);
-  const deleted = Number(before[0]?.count || 0);
+  const deleted = stale.length;
   if (deleted) {
     await logEvent('info', 'cleanup-replacements', 'stale replacement tasks deleted', {
       active: keys.length,
@@ -741,26 +1023,69 @@ async function cleanupStaleReplacementTasks(activeTaskKeys) {
 }
 
 async function getResults(keys) {
-  if (!keys.length) return [];
-  const placeholders = keys.map(() => '?').join(',');
-  return d1.query(
-    `SELECT task_key, type, card_id, image, status, author FROM tasks WHERE task_key IN (${placeholders})`,
-    keys
-  );
+  await ensureRuntimeState();
+  return keys.map(key => runtime.tasks.get(key)).filter(Boolean).map(row => ({
+    task_key: row.task_key,
+    type: row.type,
+    card_id: row.card_id,
+    image: row.image,
+    status: row.status,
+    author: row.author
+  }));
 }
 
 async function getSuggestions({ rank = '', limit = 60, offset = 0 }) {
-  const params = [];
-  let where = 'active = 1';
-  if (rank) {
-    where += ' AND rank = ?';
-    params.push(rank);
-  }
-  params.push(limit, offset);
-  return d1.query(
-    `SELECT * FROM suggestions WHERE ${where} ORDER BY CAST(card_id AS INTEGER) DESC LIMIT ? OFFSET ?`,
-    params
+  await ensureRuntimeState();
+  return [...runtime.suggestions.values()]
+    .filter(row => numberValue(row.active) === 1 && (!rank || row.rank === rank))
+    .sort((a, b) => numberValue(b.card_id) - numberValue(a.card_id))
+    .slice(offset, offset + limit);
+}
+
+async function persistRuntimeCheckpoint() {
+  if (!runtime.loaded || !runtime.checkpointDirty) return;
+  const checkpointVersion = runtime.checkpointVersion;
+  const authors = [...runtime.authors.values()].map(row => [
+    row.author_key,
+    numberValue(row.last_suggestion_checked_at),
+    numberValue(row.last_profile_checked_at)
+  ]);
+  const now = nowMs();
+  await d1.query(
+    `INSERT INTO settings(key, value, updated_at) VALUES('runtime_checkpoint_v1', ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    [JSON.stringify({ authors }), now]
   );
+  if (runtime.checkpointVersion === checkpointVersion) runtime.checkpointDirty = false;
+  runtime.lastCheckpointAt = now;
+}
+
+async function flushDirtyTasks() {
+  if (!runtime.loaded || !runtime.dirtyTaskKeys.size) return;
+  for (const key of [...runtime.dirtyTaskKeys]) {
+    const row = runtime.tasks.get(key);
+    if (!row) {
+      runtime.dirtyTaskKeys.delete(key);
+      continue;
+    }
+    await persistTask(row);
+  }
+}
+
+async function cleanupOldLogs() {
+  const now = nowMs();
+  if (now - runtime.lastLogCleanupAt < 24 * 60 * 60 * 1000) return;
+  const cutoff = now - config.logRetentionDays * 24 * 60 * 60 * 1000;
+  await d1.query('DELETE FROM logs WHERE created_at < ?', [cutoff]);
+  await d1.query("DELETE FROM logs WHERE level = 'info' AND created_at < ?", [now - 60 * 60 * 1000]);
+  runtime.lastLogCleanupAt = now;
+}
+
+async function persistRuntimeState() {
+  await ensureRuntimeState();
+  await flushDirtyTasks();
+  await persistRuntimeCheckpoint();
+  await cleanupOldLogs();
 }
 
 // ===== src/scheduler.js =====
@@ -786,6 +1111,7 @@ async function runTick({ budgetMs = config.tickBudgetMs } = {}) {
   lastTickStatus = { ok: true, running: true, step: currentTickStep, startedAt, updatedAt: startedAt };
   const stats = { cardsMonitor: false, tasksProcessed: 0, suggestionAuthors: 0, inactiveChecked: 0 };
   try {
+    await timedStep(timings, 'ensureRuntimeState', () => ensureRuntimeState());
     stats.cardsMonitor = await timedStep(timings, 'monitorCardsPage', () => monitorCardsPage());
 
     const firstTask = await timedStep(timings, 'processOneAuthorshipTask:first', () => processOneAuthorshipTask());
@@ -862,7 +1188,7 @@ async function processOneAuthorshipTask() {
   const task = tasks[0];
   if (!task) return false;
 
-  const checked = new Set(JSON.parse(task.checked_authors_json || '[]'));
+  const checked = new Set(safeJsonArray(task.checked_authors_json));
   const authors = await getAuthorsForAuthorship(task.type, [...checked]);
   if (!authors.length) {
     await updateTask(task.task_key, { status: 'not_found' });
@@ -936,7 +1262,6 @@ async function checkAuthorSuggestions(authorName) {
   const activeIds = [];
   let newCount = 0;
 
-  await upsertAuthor(authorName, { lastSuggestionCheckedAt: nowMs() });
   for (const card of cards) {
     activeIds.push(card.cardId);
     const isNewSuggestion = await upsertSuggestion(card, authorName);
@@ -948,6 +1273,7 @@ async function checkAuthorSuggestions(authorName) {
     if (isNewSuggestion) newCount += 1;
   }
   await deactivateMissingSuggestions(authorName, activeIds);
+  await upsertAuthor(authorName, { lastSuggestionCheckedAt: nowMs() });
 
   if (newCount) {
     await bumpAuthorScore(authorName, 'suggestion', newCount);
@@ -956,10 +1282,12 @@ async function checkAuthorSuggestions(authorName) {
 }
 
 async function decaySuggestionScores() {
+  await ensureRuntimeState();
   const cutoff = nowMs() - config.suggestionDecayDays * 24 * 60 * 60 * 1000;
-  const rows = await d1.query(
-    'SELECT name FROM authors WHERE suggestion_score > 0 AND last_suggestion_found_at > 0 AND last_suggestion_found_at < ?',
-    [cutoff]
+  const rows = [...runtime.authors.values()].filter(row =>
+    numberValue(row.suggestion_score) > 0 &&
+    numberValue(row.last_suggestion_found_at) > 0 &&
+    numberValue(row.last_suggestion_found_at) < cutoff
   );
   for (const row of rows) {
     await upsertAuthor(row.name, { suggestionScore: 0 });
@@ -967,10 +1295,12 @@ async function decaySuggestionScores() {
 }
 
 async function checkInactiveAuthors(limit = 20) {
-    const rows = await d1.query(
-    'SELECT * FROM authors WHERE last_profile_checked_at <= ? ORDER BY last_profile_checked_at ASC LIMIT ?',
-    [nowMs() - config.inactiveScanIntervalMs, limit]
-  );
+  await ensureRuntimeState();
+  const cutoff = nowMs() - config.inactiveScanIntervalMs;
+  const rows = [...runtime.authors.values()]
+    .filter(row => numberValue(row.last_profile_checked_at) <= cutoff)
+    .sort((a, b) => numberValue(a.last_profile_checked_at) - numberValue(b.last_profile_checked_at))
+    .slice(0, limit);
   let checked = 0;
   for (const row of rows) {
     try {
@@ -997,10 +1327,15 @@ app.get('/', async () => ({
   service: 'anime-cards-server',
   running: tickRunning,
   currentTickStep,
-  lastTickStatus
+  lastTickStatus,
+  runtimeCache: runtimeStats()
 }));
 
-app.get('/health', async () => ({ ok: true, service: 'anime-cards-server' }));
+app.get('/health', async () => ({
+  ok: true,
+  service: 'anime-cards-server',
+  runtimeCache: runtimeStats()
+}));
 
 app.get('/api/tick', async request => {
   const budgetMs = Number(request.query?.budgetMs || config.tickBudgetMs);
@@ -1017,7 +1352,7 @@ app.get('/api/tick', async request => {
 });
 
 app.get('/api/tick-status', async () => {
-  return { ok: true, running: tickRunning, currentTickStep, lastTickStatus };
+  return { ok: true, running: tickRunning, currentTickStep, lastTickStatus, runtimeCache: runtimeStats() };
 });
 
 app.get('/api/activity', async request => {
@@ -1071,28 +1406,31 @@ app.post('/api/admin/monitor-cards', async (request, reply) => {
 app.post('/api/admin/cleanup-created-tasks', async (request, reply) => {
   requireAdmin(request, reply);
   if (reply.sent) return;
+  await ensureRuntimeState();
   const belowId = Number(request.body?.belowId || request.query?.belowId || 90000);
-  const before = await d1.query(
-    `SELECT COUNT(*) AS count FROM tasks
-     WHERE type = 'created'
-       AND status IN ('pending', 'checking')
-       AND author IS NULL
-       AND CAST(card_id AS INTEGER) < ?`,
-    [belowId]
+  const stale = [...runtime.tasks.values()].filter(row =>
+    row.type === 'created' &&
+    (row.status === 'pending' || row.status === 'checking') &&
+    !row.author &&
+    numberValue(row.card_id) < belowId
   );
-  await d1.query(
-    `DELETE FROM tasks
-     WHERE type = 'created'
-       AND status IN ('pending', 'checking')
-       AND author IS NULL
-       AND CAST(card_id AS INTEGER) < ?`,
-    [belowId]
-  );
+  if (stale.length) {
+    for (const batch of chunks(stale)) {
+      await d1.query(
+        `DELETE FROM tasks WHERE task_key IN (${batch.map(() => '?').join(',')})`,
+        batch.map(row => row.task_key)
+      );
+      for (const row of batch) {
+        runtime.tasks.delete(row.task_key);
+        runtime.dirtyTaskKeys.delete(row.task_key);
+      }
+    }
+  }
   await logEvent('info', 'cleanup-created-tasks', 'old created pending tasks deleted', {
     belowId,
-    deleted: Number(before[0]?.count || 0)
+    deleted: stale.length
   });
-  return { ok: true, belowId, deleted: Number(before[0]?.count || 0) };
+  return { ok: true, belowId, deleted: stale.length };
 });
 
 app.post('/api/admin/check-suggestions', async (request, reply) => {
@@ -1129,14 +1467,23 @@ app.get('/api/suggestions', async request => {
 });
 
 app.get('/api/rank', async request => {
+  await ensureRuntimeState();
   const limit = Math.min(Number(request.query?.limit || 100), 500);
-  const rows = await d1.query(
-    `SELECT name, created_score, replacement_score, suggestion_score, inactive
-     FROM authors
-     ORDER BY (created_score + replacement_score + suggestion_score) DESC, suggestion_score DESC, name COLLATE NOCASE ASC
-     LIMIT ?`,
-    [limit]
-  );
+  const rows = [...runtime.authors.values()]
+    .sort((a, b) =>
+      (numberValue(b.created_score) + numberValue(b.replacement_score) + numberValue(b.suggestion_score)) -
+      (numberValue(a.created_score) + numberValue(a.replacement_score) + numberValue(a.suggestion_score)) ||
+      numberValue(b.suggestion_score) - numberValue(a.suggestion_score) ||
+      a.name.localeCompare(b.name, 'ru')
+    )
+    .slice(0, limit)
+    .map(row => ({
+      name: row.name,
+      created_score: row.created_score,
+      replacement_score: row.replacement_score,
+      suggestion_score: row.suggestion_score,
+      inactive: row.inactive
+    }));
   return { ok: true, rows };
 });
 
@@ -1151,6 +1498,9 @@ function startAutoTick() {
   };
   setTimeout(run, 5000);
   setInterval(run, intervalMs);
+  setInterval(() => {
+    persistRuntimeState().catch(error => console.error('[runtime-checkpoint]', error));
+  }, Math.max(config.runtimeCheckpointIntervalMs, 60000));
   console.log(`[auto-tick] enabled, interval ${intervalMs}ms`);
 }
 
