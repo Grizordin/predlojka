@@ -2,6 +2,9 @@ import fs from 'node:fs/promises';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import * as cheerio from 'cheerio';
+import { deflate, inflate } from 'node:zlib';
+import { promisify } from 'node:util';
+import { AdaptiveScheduler, activityScore, MAX_INTERVAL, MINUTE, HOUR, DAY } from './adaptive-scheduler.js';
 
 
 // ===== src/config.js =====
@@ -18,7 +21,7 @@ const config = {
     passwordField: process.env.ANIMESSS_PASSWORD_FIELD || 'login_password',
     submitField: process.env.ANIMESSS_LOGIN_SUBMIT_FIELD || 'login',
     submitValue: process.env.ANIMESSS_LOGIN_SUBMIT_VALUE || 'submit',
-    requestDelayMs: Number(process.env.ANIMESSS_REQUEST_DELAY_MS || 550)
+    requestDelayMs: Math.max(1000, Number(process.env.ANIMESSS_REQUEST_DELAY_MS || 1000))
   },
   cloudflare: {
     accountId: process.env.CLOUDFLARE_ACCOUNT_ID || '',
@@ -26,7 +29,9 @@ const config = {
     apiToken: process.env.CLOUDFLARE_API_TOKEN || ''
   },
   adminToken: process.env.ADMIN_TOKEN || '',
-  tickBudgetMs: Number(process.env.TICK_BUDGET_MS || 35000),
+  tickBudgetMs: Math.min(45000, Math.max(5000, Number(process.env.TICK_BUDGET_MS || 35000))),
+  suggestionRequestsPerHour: Math.max(1, Number(process.env.SUGGESTION_REQUESTS_PER_HOUR || 600)),
+  replacementRequestsPerHour: Math.max(1, Number(process.env.REPLACEMENT_REQUESTS_PER_HOUR || 300)),
   cardsMonitorIntervalMs: Number(process.env.CARDS_MONITOR_INTERVAL_MS || 60000),
   inactiveScanIntervalMs: Number(process.env.INACTIVE_SCAN_INTERVAL_MS || 86400000),
   suggestionRatedIntervalMs: Number(process.env.SUGGESTION_RATED_INTERVAL_MS || 600000),
@@ -117,6 +122,7 @@ function assertD1Config() {
 
 class D1Client {
   constructor() {
+    this.usage = { since: Date.now(), queries: 0, rowsRead: 0, rowsWritten: 0 };
     this.endpoint = `https://api.cloudflare.com/client/v4/accounts/${config.cloudflare.accountId}/d1/database/${config.cloudflare.databaseId}/query`;
   }
 
@@ -134,6 +140,11 @@ class D1Client {
     if (!response.ok || !json?.success) {
       throw new Error(`D1 query failed ${response.status}: ${JSON.stringify(json)}`);
     }
+    this.usage.queries++;
+    for (const result of json.result || []) {
+      this.usage.rowsRead += Number(result.meta?.rows_read || 0);
+      this.usage.rowsWritten += Number(result.meta?.rows_written || 0);
+    }
     return json.result?.[0]?.results || [];
   }
 
@@ -149,6 +160,8 @@ class D1Client {
 }
 
 const d1 = new D1Client();
+const compressState = promisify(deflate);
+const decompressState = promisify(inflate);
 
 // ===== src/animesss.js =====
 const REQUEST_HEADERS = {
@@ -205,6 +218,9 @@ class AnimeSSSClient {
     this.staticCookie = config.anime.cookie || '';
     this.cookieByOrigin = new Map();
     this.nextRequestAt = 0;
+    this.requestQueue = Promise.resolve();
+    this.cooldownUntil = 0;
+    this.networkFailures = 0;
     this.origins = this.makeOrigins();
   }
 
@@ -340,7 +356,27 @@ class AnimeSSSClient {
     return html;
   }
 
-  async fetchHtml(urlOrPath) {
+  fetchHtml(urlOrPath) {
+    const operation = this.requestQueue.then(async () => {
+      if (Date.now() < this.cooldownUntil) throw new Error('site cooldown active');
+      try {
+        const html = await this.fetchHtmlInternal(urlOrPath);
+        if (!/<(?:html|body)\b/i.test(html) || /checking your browser|verify you are human|just a moment|captcha-container/i.test(html)) {
+          throw new Error('unrecognized site page; not treated as an empty list');
+        }
+        this.networkFailures = 0;
+        return html;
+      } catch (error) {
+        this.networkFailures++;
+        this.cooldownUntil = Date.now() + Math.min(10 * MINUTE, 15000 * 2 ** Math.min(6, this.networkFailures - 1));
+        throw error;
+      }
+    });
+    this.requestQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  async fetchHtmlInternal(urlOrPath) {
     const path = this.pathFromUrl(urlOrPath);
     const errors = [];
 
@@ -350,6 +386,7 @@ class AnimeSSSClient {
       } catch (error) {
         this.cookieByOrigin.delete(origin);
         errors.push(`${origin}${path}: ${error.message}`);
+        if (/HTTP (429|403)/.test(error.message)) throw error;
         console.warn(`[AnimeSSS] not available: ${origin}${path} - ${error.message}`);
       }
     }
@@ -416,6 +453,7 @@ function parseCardsPage(html, baseUrl) {
     addedCards: parseAddedCards($, baseUrl),
     replacements: parseReplacementVotes($, baseUrl),
     visibleAuthors: parseVisibleCatalogAuthors($),
+    catalogCards: parseVisibleCatalogCards($, baseUrl),
     addedDebug: parseAddedCardsDebug($)
   };
 }
@@ -488,6 +526,14 @@ function parseReplacementVotes($, baseUrl) {
   }).filter(Boolean);
 }
 
+function parseVisibleCatalogCards($, baseUrl) {
+  return $('.anime-cards__item[data-id][data-author]').toArray().filter(node => {
+    const item = $(node);
+    return !item.closest('.cards-replace-vote-list,.card-replace-vote,[data-suite-vote-block="1"]').length
+      && !item.closest('.anime-cards__item-wrapper,.anime-cards__item-wrapper-gl').find('.card-votes').length;
+  }).map(node => cardFromNode($, node, baseUrl)).filter(card => card.cardId && card.author);
+}
+
 function parseVisibleCatalogAuthors($) {
   const authors = new Set();
   $('.anime-cards__item[data-id][data-author]').each((_, node) => {
@@ -522,6 +568,15 @@ function parseReplacementPage(html, baseUrl) {
 }
 
 // ===== src/db.js =====
+let adaptive = null;
+let adaptiveSavedRevision = -1;
+let adaptiveLastSavedAt = 0;
+let adaptiveLastSaveError = '';
+let persistInFlight = null;
+let lastCatalogMonitorAt = 0;
+let activeCreatedKeys = new Set();
+let activeReplacementKeys = new Set();
+const authorPageCache = new Map(); // Bounded, short-lived parsed lists; never raw HTML.
 const runtime = {
   loaded: false,
   loading: null,
@@ -566,6 +621,7 @@ function sameFields(left, right, fields) {
 
 function runtimeStats() {
   return {
+    schedulerVersion: adaptive ? 'adaptive-1' : null,
     loaded: runtime.loaded,
     authors: runtime.authors.size,
     cards: runtime.cards.size,
@@ -624,7 +680,7 @@ function hydrateRuntime(authors, cards, suggestions, tasks, checkpointRows, logs
 }
 
 async function ensureRuntimeState() {
-  if (runtime.loaded) return;
+  if (runtime.loaded && adaptive) return;
   if (runtime.loading) return runtime.loading;
   runtime.loading = (async () => {
     const [authors, cards, suggestions, tasks, checkpointRows, logs] = await Promise.all([
@@ -640,6 +696,21 @@ async function ensureRuntimeState() {
       )
     ]);
     hydrateRuntime(authors, cards, suggestions, tasks, checkpointRows, logs);
+    const saved = await d1.query("SELECT value FROM settings WHERE key = 'adaptive_authors_v1'");
+    let state = saved[0]?.value ? JSON.parse(saved[0].value) : null;
+    if (state?.encoding === 'deflate-base64') {
+      state = JSON.parse((await decompressState(Buffer.from(state.data, 'base64'), { maxOutputLength: 16 * 1024 * 1024 })).toString('utf8'));
+    }
+    adaptive = new AdaptiveScheduler([...runtime.authors.values()], state, nowMs(), {
+      budget: config.suggestionRequestsPerHour, replacementBudget: config.replacementRequestsPerHour,
+      dutyCycle: Math.min(1, config.tickBudgetMs / Math.max(config.cardsMonitorIntervalMs, 10000))
+    });
+    adaptive.state.createdCoverage ||= {};
+    adaptive.state.taskEpoch ||= {};
+    adaptive.state.sweepRetry ||= {};
+    adaptive.seedEvents(runtime.cards.keys(),
+      [...runtime.tasks.values()].filter(task => task.type === 'replacement' && task.status === 'found').map(task => task.task_key));
+    if (!state) await persistAdaptiveState(); // Save the initial spread before the first request.
   })();
   try {
     await runtime.loading;
@@ -655,6 +726,7 @@ async function migrate(schemaSql) {
   await d1.exec(schemaSql);
 }
 
+const persistedLogTimes = new Map();
 async function logEvent(level, scope, message, data = null) {
   const row = {
     level,
@@ -666,6 +738,11 @@ async function logEvent(level, scope, message, data = null) {
   runtime.logs.unshift(row);
   if (runtime.logs.length > config.runtimeLogLimit) runtime.logs.length = config.runtimeLogLimit;
   if (level === 'warn' || level === 'error') {
+    const signature = scope + ':' + message;
+    const last = persistedLogTimes.get(signature);
+    if (last && row.created_at - last < 5 * MINUTE) return;
+    persistedLogTimes.set(signature, row.created_at);
+    if (persistedLogTimes.size > 200) persistedLogTimes.delete(persistedLogTimes.keys().next().value);
     try {
       await d1.query(
         'INSERT INTO logs(level, scope, message, data_json, created_at) VALUES(?, ?, ?, ?, ?)',
@@ -1081,11 +1158,33 @@ async function cleanupOldLogs() {
   runtime.lastLogCleanupAt = now;
 }
 
+async function persistAdaptiveState() {
+  if (!adaptive || adaptiveSavedRevision === adaptive.revision) return;
+  const revision = adaptive.revision;
+  const snapshot = JSON.stringify({ encoding: 'deflate-base64',
+    data: (await compressState(JSON.stringify(adaptive.state))).toString('base64') });
+  // Keep settings values below a conservative payload ceiling; never discard state silently.
+  if (Buffer.byteLength(snapshot, 'utf8') > 1_500_000) throw new Error('adaptive state too large; export and compact required');
+  await d1.query(
+    "INSERT INTO settings(key,value,updated_at) VALUES('adaptive_authors_v1',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+    [snapshot, nowMs()]);
+  adaptiveSavedRevision = revision;
+  adaptiveLastSavedAt = nowMs();
+  adaptiveLastSaveError = '';
+}
+
 async function persistRuntimeState() {
-  await ensureRuntimeState();
-  await flushDirtyTasks();
-  await persistRuntimeCheckpoint();
-  await cleanupOldLogs();
+  if (persistInFlight) return persistInFlight;
+  persistInFlight = (async () => {
+    await ensureRuntimeState();
+    await flushDirtyTasks();
+    await persistRuntimeCheckpoint();
+    try { await persistAdaptiveState(); }
+    catch (error) { adaptiveLastSaveError = error.message; throw error; }
+    await cleanupOldLogs();
+  })();
+  try { return await persistInFlight; }
+  finally { persistInFlight = null; }
 }
 
 // ===== src/scheduler.js =====
@@ -1106,51 +1205,64 @@ async function timedStep(timings, name, fn) {
 async function runTick({ budgetMs = config.tickBudgetMs } = {}) {
   if (tickRunning) return { ok: true, running: true, skipped: true };
   tickRunning = true;
+  budgetMs = Math.min(config.tickBudgetMs, Math.max(1000, Number(budgetMs) || config.tickBudgetMs));
   const startedAt = nowMs();
   const timings = {};
-  lastTickStatus = { ok: true, running: true, step: currentTickStep, startedAt, updatedAt: startedAt };
   const stats = { cardsMonitor: false, tasksProcessed: 0, suggestionAuthors: 0, inactiveChecked: 0 };
+  lastTickStatus = { ok: true, running: true, startedAt, updatedAt: startedAt };
   try {
-    await timedStep(timings, 'ensureRuntimeState', () => ensureRuntimeState());
-    stats.cardsMonitor = await timedStep(timings, 'monitorCardsPage', () => monitorCardsPage());
-
-    const firstTask = await timedStep(timings, 'processOneAuthorshipTask:first', () => processOneAuthorshipTask());
-    if (firstTask) stats.tasksProcessed += 1;
-
-    while (nowMs() - startedAt < budgetMs) {
-      const didTask = await timedStep(timings, 'processOneAuthorshipTask:loop', () => processOneAuthorshipTask());
-      if (didTask) {
-        stats.tasksProcessed += 1;
-        continue;
-      }
-      const didSuggestion = await timedStep(timings, 'processSuggestionAuthors', () => processSuggestionAuthors(1));
-      if (didSuggestion) {
-        stats.suggestionAuthors += didSuggestion;
-        continue;
-      }
-      break;
+    await ensureRuntimeState();
+    if (nowMs() >= anime.cooldownUntil && nowMs() - lastCatalogMonitorAt >= config.cardsMonitorIntervalMs) {
+      stats.cardsMonitor = await timedStep(timings, 'monitorCardsPage', monitorCardsPage);
     }
-    const result = { ok: true, running: false, elapsedMs: nowMs() - startedAt, timings, ...stats };
+    while (nowMs() - startedAt < budgetMs && nowMs() >= anime.cooldownUntil) {
+      // Each queue gets a turn: pending replacements can no longer suppress suggestions.
+      let worked = false;
+      if (nowMs() - startedAt < budgetMs) {
+        const count = await timedStep(timings, 'suggestions', () => processSuggestionAuthors(1));
+        stats.suggestionAuthors += count;
+        worked ||= count > 0;
+      }
+      if (nowMs() - startedAt < budgetMs && nowMs() >= anime.cooldownUntil) {
+        const count = await timedStep(timings, 'authorship', processOneAuthorshipTask);
+        stats.tasksProcessed += Number(count);
+        worked ||= Boolean(count);
+      }
+      if (!worked) await sleep(500); // Yield; no busy DOM/CPU loop.
+    }
+    const health = adaptive.report([...runtime.authors.values()], nowMs());
+    const result = { ok: true, running: false, elapsedMs: nowMs() - startedAt,
+      timings, ...stats, overdueAuthors: health.overdue, capacityInsufficient: health.capacityInsufficient };
     lastTickStatus = { ...result, updatedAt: nowMs() };
     return result;
   } catch (error) {
-    await logEvent('error', 'tick', error.message, { stack: error.stack });
-    const result = { ok: false, running: false, step: currentTickStep, error: error.message, timings, ...stats };
-    lastTickStatus = { ...result, updatedAt: nowMs() };
-    return result;
-  } finally {
-    tickRunning = false;
-    currentTickStep = 'idle';
-  }
+    await logEvent('error', 'tick', error.message);
+    lastTickStatus = { ok: false, running: false, step: currentTickStep, error: error.message, ...stats, updatedAt: nowMs() };
+    return lastTickStatus;
+  } finally { tickRunning = false; currentTickStep = 'idle'; }
 }
 
 async function monitorCardsPage() {
   const html = await anime.fetchHtml(anime.cardsUrl());
   const parsed = parseCardsPage(html, anime.baseUrl);
 
-  for (const author of parsed.visibleAuthors) {
-    await upsertAuthor(author);
+  for (const author of parsed.visibleAuthors) await upsertAuthor(author);
+  activeCreatedKeys = new Set(parsed.addedCards.map(card => taskKey('created', card.cardId)));
+  activeReplacementKeys = new Set(parsed.replacements.map(card => taskKey('replacement', card.cardId, card.newImage)));
+  for (const card of parsed.catalogCards) {
+    const key = authorKey(card.author);
+    const knownCard = runtime.cards.has(String(card.cardId));
+    const firstObservedPublication = adaptive.catalogIsNew(card.cardId);
+    adaptive.addAuthor(key, nowMs());
+    if (firstObservedPublication) {
+      // Existing moderation -> publication is a wake-up signal, not a second activity point.
+      if (!knownCard) adaptive.observe(key, 'suggestion', [card.cardId], nowMs());
+      adaptive.wake(key, nowMs());
+      await upsertAuthor(card.author, { inactive: 0 });
+      await upsertCard(card, 'catalog', card.author);
+    }
   }
+  lastCatalogMonitorAt = nowMs();
 
   for (const card of parsed.addedCards) {
     if (card.author) await upsertAuthor(card.author);
@@ -1161,10 +1273,10 @@ async function monitorCardsPage() {
   for (const replacement of parsed.replacements) {
     await upsertTask('replacement', replacement);
   }
-  const activeReplacementKeys = parsed.replacements.map(replacement =>
+  const visibleReplacementKeys = parsed.replacements.map(replacement =>
     taskKey('replacement', replacement.cardId, replacement.newImage || replacement.image || '')
   );
-  const staleReplacementsDeleted = await cleanupStaleReplacementTasks(activeReplacementKeys);
+  const staleReplacementsDeleted = await cleanupStaleReplacementTasks(visibleReplacementKeys);
 
   await logEvent('info', 'cards-monitor', 'cards page parsed', {
     addedCards: parsed.addedCards.length,
@@ -1183,102 +1295,160 @@ async function monitorCardsPage() {
   };
 }
 
-async function processOneAuthorshipTask() {
-  const tasks = await getPendingTasks(1);
-  const task = tasks[0];
-  if (!task) return false;
-
-  const checked = new Set(safeJsonArray(task.checked_authors_json));
-  const authors = await getAuthorsForAuthorship(task.type, [...checked]);
-  if (!authors.length) {
-    await updateTask(task.task_key, { status: 'not_found' });
-    return true;
-  }
-
-  const author = authors[0];
-  checked.add(author.author_key);
-  try {
-    if (task.type === 'created') {
-      const html = await anime.fetchHtml(anime.createdModerationUrl(author.name));
-      const cards = parseCreatedModerationCards(html, anime.baseUrl, author.name);
-      const found = cards.find(card => card.cardId === String(task.card_id));
-      if (found) {
-        await upsertCard(found, 'cards_added', author.name);
-        await updateTask(task.task_key, {
-          status: 'found',
-          author: author.name,
-          checkedAuthorsJson: JSON.stringify([...checked])
-        });
-        await bumpAuthorScore(author.name, 'created', 1);
-        return true;
-      }
-    } else if (task.type === 'replacement') {
-      const html = await anime.fetchHtml(anime.replacementPendingUrl(author.name));
-      const byId = parseReplacementPage(html, anime.baseUrl);
-      const images = byId.get(String(task.card_id)) || new Set();
-      if (images.has(imagePath(anime.baseUrl, task.image))) {
-        await updateTask(task.task_key, {
-          status: 'found',
-          author: author.name,
-          checkedAuthorsJson: JSON.stringify([...checked])
-        });
-        await bumpAuthorScore(author.name, 'replacement', 1);
-        return true;
-      }
-    }
-    await updateTask(task.task_key, {
-      status: 'checking',
-      checkedAuthorsJson: JSON.stringify([...checked])
-    });
-  } catch (error) {
-    await updateTask(task.task_key, {
-      status: 'checking',
-      checkedAuthorsJson: JSON.stringify([...checked]),
-      lastError: error.message
-    });
-    await logEvent('warn', 'authorship-task', error.message, { taskKey: task.task_key, author: author.name });
-  }
-  return true;
+function visibleAuthorshipTasks(type) {
+  if (nowMs() - lastCatalogMonitorAt > 5 * MINUTE) return [];
+  const active = type === 'replacement' ? activeReplacementKeys : activeCreatedKeys;
+  return [...runtime.tasks.values()].filter(task => task.type === type && active.has(task.task_key)
+    && (task.status === 'pending' || task.status === 'checking' ||
+      (task.status === 'not_found' && task.updated_at + MAX_INTERVAL <= nowMs())));
 }
 
-async function processSuggestionAuthors(limit = 3) {
-  const authors = await getAuthorsForSuggestions(
-    limit,
-    nowMs(),
-    config.suggestionRatedIntervalMs,
-    config.suggestionZeroIntervalMs
-  );
+function epochFor(task) {
+  return adaptive.state.taskEpoch[task.task_key] || Number(task.created_at) || 0;
+}
+
+async function fetchAuthorList(author, kind, notOlderThan = 0) {
+  const key = kind + ':' + authorKey(author);
+  const cached = authorPageCache.get(key);
+  if (cached && cached.at >= notOlderThan && cached.at + 2 * MINUTE > nowMs()) return cached;
+  const html = await anime.fetchHtml(kind === 'replacement'
+    ? anime.replacementPendingUrl(author) : anime.createdModerationUrl(author));
+  const items = kind === 'replacement' ? parseReplacementPage(html, anime.baseUrl)
+    : parseCreatedModerationCards(html, anime.baseUrl, author);
+  const page = { at: nowMs(), items };
+  authorPageCache.set(key, page);
+  for (const [key, value] of authorPageCache) {
+    if (value.at + 2 * MINUTE < nowMs() || authorPageCache.size > 128) authorPageCache.delete(key);
+  }
+  return page;
+}
+
+async function processOneAuthorshipTask() {
+  const now = nowMs();
+  if (now < adaptive.state.nextReplacementAt) return false;
+  const choices = ['replacement', 'created'];
+  // Retain S-card authorship, but only for cards actually present in a current voting block.
+  if (adaptive.state.lastAuthorshipKind === 'replacement') choices.reverse();
+  for (const type of choices) {
+    const tasks = visibleAuthorshipTasks(type);
+    if (!tasks.length) continue;
+    for (const task of tasks) {
+      if (task.status === 'not_found') {
+        adaptive.state.taskEpoch[task.task_key] = now;
+        adaptive.touch();
+        await updateTask(task.task_key, { status: 'checking', checkedAuthorsJson: '[]' });
+      }
+    }
+    const oldest = Math.min(...tasks.map(epochFor));
+    const candidates = [...runtime.authors.values()].map(row => {
+      const entry = adaptive.addAuthor(row.author_key, now);
+      const lane = entry.replacement;
+      const coveredAt = type === 'replacement' ? lane.lastSuccess : (adaptive.state.createdCoverage[row.author_key] || 0);
+      const retry = adaptive.state.sweepRetry[type + ':' + row.author_key] || 0;
+      const score = type === 'replacement' ? activityScore(lane, now, adaptive.state.startedAt)
+        : Math.max(0, Number(row.created_score) || 0);
+      return { row, lane, coveredAt, retry, score };
+    });
+    const eligible = candidates.filter(x => x.coveredAt < oldest && x.retry <= now)
+      .sort((a, b) => {
+        const urgentA = now - oldest >= MAX_INTERVAL;
+        // Once a sweep is overdue, visit least recently checked authors first.
+        return (urgentA ? a.coveredAt - b.coveredAt : b.score - a.score)
+          || a.coveredAt - b.coveredAt || a.row.author_key.localeCompare(b.row.author_key);
+      });
+    const chosen = eligible[0];
+    if (!chosen) {
+      if (candidates.length && candidates.every(x => x.coveredAt >= oldest)) {
+        const coveredThrough = Math.min(...candidates.map(x => x.coveredAt));
+        for (const task of tasks.filter(task => epochFor(task) <= coveredThrough)) {
+          await updateTask(task.task_key, { status: 'not_found' });
+        }
+      }
+      continue;
+    }
+    adaptive.reserve('replacement', now);
+    adaptive.state.lastAuthorshipKind = type;
+    const key = chosen.row.author_key;
+    try {
+      const page = await fetchAuthorList(chosen.row.name, type === 'replacement' ? 'replacement' : 'suggestion', oldest);
+      if (type === 'replacement') {
+        const uniqueReplacements = [...page.items].flatMap(([id, images]) => [...images].map(image => taskKey('replacement', id, image)));
+        const count = adaptive.observe(key, 'replacement', uniqueReplacements, nowMs());
+        if (count) await upsertAuthor(chosen.row.name, { inactive: 0 });
+        for (const task of tasks) {
+          if (page.items.get(String(task.card_id))?.has(imagePath(anime.baseUrl, task.image))) {
+            await updateTask(task.task_key, { status: 'found', author: chosen.row.name });
+            await bumpAuthorScore(chosen.row.name, 'replacement', 1);
+          }
+        }
+        adaptive.success(key, 'replacement', page.at);
+      } else {
+        // The same moderation fetch also updates suggestions; no second network request.
+        await applyAuthorSuggestions(chosen.row.name, page.items, page.at);
+      }
+      delete adaptive.state.sweepRetry[type + ':' + key];
+      if (adaptive.state.sweepRetryCount) delete adaptive.state.sweepRetryCount[type + ':' + key];
+      adaptive.touch();
+    } catch (error) {
+      // Failed HTTP/parsing is NOT negative coverage for any task.
+      const retries = (adaptive.state.sweepRetryCount ||= {});
+      const token = type + ':' + key;
+      retries[token] = Math.min(6, (retries[token] || 0) + 1);
+      adaptive.state.sweepRetry[token] = nowMs() + Math.min(HOUR, MINUTE * 2 ** (retries[token] - 1));
+      adaptive.touch();
+      await logEvent('warn', 'authorship-task', error.message, { author: chosen.row.name, type });
+    }
+    return true;
+  }
+  return false;
+}
+
+async function processSuggestionAuthors(limit = 1) {
   let processed = 0;
-  for (const author of authors) {
-    await checkAuthorSuggestions(author.name);
-    processed += 1;
+  while (processed < limit && nowMs() >= anime.cooldownUntil) {
+    const next = adaptive.nextSuggestion([...runtime.authors.values()], nowMs());
+    if (!next) break;
+    adaptive.reserve('suggestion', nowMs());
+    try {
+      await checkAuthorSuggestions(next.row.name);
+    } catch (error) {
+      adaptive.failure(next.row.author_key, 'suggestion', nowMs());
+      await logEvent('warn', 'suggestions', error.message, { author: next.row.name });
+    }
+    processed++;
   }
   return processed;
 }
 
 async function checkAuthorSuggestions(authorName) {
-  const html = await anime.fetchHtml(anime.createdModerationUrl(authorName));
-  const cards = parseCreatedModerationCards(html, anime.baseUrl, authorName);
+  const page = await fetchAuthorList(authorName, 'suggestion');
+  await applyAuthorSuggestions(authorName, page.items, page.at);
+}
+
+async function applyAuthorSuggestions(authorName, cards, fetchedAt) {
+  const key = authorKey(authorName);
   const activeIds = [];
   let newCount = 0;
-
   for (const card of cards) {
     activeIds.push(card.cardId);
-    const isNewSuggestion = await upsertSuggestion(card, authorName);
-    await updateTask(await upsertTask('created', { cardId: card.cardId, image: card.image }), {
-      status: 'found',
-      author: authorName,
-      checkedAuthorsJson: JSON.stringify([authorKey(authorName)])
-    });
-    if (isNewSuggestion) newCount += 1;
+    const knownCard = runtime.cards.has(String(card.cardId));
+    const isNew = await upsertSuggestion(card, authorName);
+    if (!knownCard) adaptive.observe(key, 'suggestion', [card.cardId], fetchedAt);
+    // Do not create dormant S-vote tasks for every moderation card.
+    const existing = runtime.tasks.get(taskKey('created', card.cardId));
+    if (existing && existing.status !== 'found') {
+      await updateTask(existing.task_key, { status: 'found', author: authorName });
+      if (activeCreatedKeys.has(existing.task_key)) await bumpAuthorScore(authorName, 'created', 1);
+    }
+    if (isNew) newCount++;
   }
   await deactivateMissingSuggestions(authorName, activeIds);
-  await upsertAuthor(authorName, { lastSuggestionCheckedAt: nowMs() });
-
-  if (newCount) {
-    await bumpAuthorScore(authorName, 'suggestion', newCount);
-    await upsertAuthor(authorName, { lastSuggestionFoundAt: nowMs() });
-  }
+  await upsertAuthor(authorName, { lastSuggestionCheckedAt: fetchedAt,
+    ...(newCount ? { inactive: 0, lastSuggestionFoundAt: fetchedAt } : {}) });
+  if (newCount) await bumpAuthorScore(authorName, 'suggestion', newCount);
+  adaptive.state.createdCoverage[key] = fetchedAt;
+  const plan = adaptive.plan([...runtime.authors.values()], nowMs()).planned.find(x => x.row.author_key === key);
+  adaptive.success(key, 'suggestion', fetchedAt, plan?.interval || MAX_INTERVAL);
 }
 
 async function decaySuggestionScores() {
@@ -1321,6 +1491,21 @@ async function checkInactiveAuthors(limit = 20) {
 // ===== src/server.js =====
 const app = Fastify({ logger: true });
 await app.register(cors, { origin: true });
+
+// Full export is authenticated and reads memory, not another SELECT per visitor.
+app.get('/api/admin/authors', async (request, reply) => {
+  if (!config.adminToken) return reply.code(503).send({ ok: false, error: 'ADMIN_TOKEN is required for export' });
+  if (request.headers['x-admin-token'] !== config.adminToken) {
+    return reply.code(401).send({ ok: false, error: 'admin token required' });
+  }
+  await ensureRuntimeState();
+  reply.header('cache-control', 'no-store');
+  return { ok: true, ...adaptive.report([...runtime.authors.values()], nowMs()),
+    d1UsageSinceStartup: d1.usage,
+    lastAdaptiveSavedAt: adaptiveLastSavedAt,
+    lastAdaptiveSaveError: adaptiveLastSaveError,
+    note: 'Live schedule; deployment downtime and site errors can cause overdue work.' };
+});
 
 app.get('/', async () => ({
   ok: true,
@@ -1399,8 +1584,10 @@ app.post('/api/admin/import-state', async (request, reply) => {
 app.post('/api/admin/monitor-cards', async (request, reply) => {
   requireAdmin(request, reply);
   if (reply.sent) return;
-  await monitorCardsPage();
-  return { ok: true };
+  if (tickRunning) return reply.code(409).send({ ok: false, error: 'scheduler busy' });
+  tickRunning = true;
+  try { await ensureRuntimeState(); await monitorCardsPage(); return { ok: true }; }
+  finally { tickRunning = false; }
 });
 
 app.post('/api/admin/cleanup-created-tasks', async (request, reply) => {
@@ -1436,18 +1623,24 @@ app.post('/api/admin/cleanup-created-tasks', async (request, reply) => {
 app.post('/api/admin/check-suggestions', async (request, reply) => {
   requireAdmin(request, reply);
   if (reply.sent) return;
-  const limit = Number(request.body?.limit || 10);
-  const processed = await processSuggestionAuthors(limit);
-  await decaySuggestionScores();
-  return { ok: true, processed };
+  if (tickRunning) return reply.code(409).send({ ok: false, error: 'scheduler busy' });
+  tickRunning = true;
+  try {
+    await ensureRuntimeState();
+    const processed = await processSuggestionAuthors(Math.min(10, Math.max(1, Number(request.body?.limit) || 1)));
+    return { ok: true, processed };
+  } finally { tickRunning = false; }
 });
 
 app.post('/api/admin/check-inactive', async (request, reply) => {
   requireAdmin(request, reply);
   if (reply.sent) return;
-  const limit = Number(request.body?.limit || 20);
-  const checked = await checkInactiveAuthors(limit);
-  return { ok: true, checked };
+  if (tickRunning) return reply.code(409).send({ ok: false, error: 'scheduler busy' });
+  tickRunning = true;
+  try {
+    const checked = await checkInactiveAuthors(Math.min(20, Math.max(1, Number(request.body?.limit) || 1)));
+    return { ok: true, checked };
+  } finally { tickRunning = false; }
 });
 
 app.get('/api/results', async request => {
