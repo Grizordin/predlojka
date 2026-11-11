@@ -27,6 +27,8 @@ async function harness(rows = [makeRow('Author')]) {
     return { app, runtime, anime, d1, config, monitorCardsPage, processSuggestionAuthors,
       processOneAuthorshipTask, applyAuthorSuggestions, persistAdaptiveState, ensureRuntimeState,
       persistRuntimeState, runTick, parseCardsPage, AnimeSSSClient, logEvent,
+      pendingSubmissionHints, verifiedReplacementHints, processSubmissionHint,
+      cancelSubmissionTimer() { clearTimeout(submissionHintTimer); submissionHintTimer = null; submissionHintWakeAt = Infinity; },
       get scheduler() { return adaptive; },
       setup(rows) {
         hydrateRuntime(rows, [], [], [], [], []);
@@ -248,4 +250,74 @@ test('repeat identical warning stays in memory but writes to D1 at most once per
   assert.equal(h.writes.length, 1);
   assert.equal(h.runtime.logs.length, 20);
   await h.app.close();
+});
+
+test('submission hint checks only the named author and preserves the normal scan coverage', async () => {
+  const h = await harness();
+  const checked = [];
+  h.anime.fetchHtml = async (url, verify) => {
+    checked.push({ url, verify });
+    return '<html><body><div class="anime-cards__item" data-id="123"><img src="/123.png"></div></body></html>';
+  };
+  try {
+    await h.applyAuthorSuggestions('Author', [card('99')], NOW);
+    const signal = { method: 'POST', url: '/api/submission-hints', payload: { nick: 'Author', kind: 'created' } };
+    const queued = await h.app.inject(signal);
+    assert.equal(queued.statusCode, 202);
+    assert.equal(queued.json().queued, true);
+    const duplicate = await h.app.inject(signal);
+    assert.equal(duplicate.json().duplicate, true);
+    for (let i = 0; i < 30 && !h.runtime.suggestions.has('123'); i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(checked, [{ url: 'https://animesss.tv/user/Author/cards_created/?moderation=1', verify: true }]);
+    assert.equal(h.runtime.suggestions.get('123').author, 'Author');
+    assert.equal(h.runtime.suggestions.get('99').active, 1);
+    assert.equal(h.scheduler.state.createdCoverage.author, NOW);
+    assert.ok(h.scheduler.state.nextSuggestionAt > NOW);
+  } finally { h.cancelSubmissionTimer(); await h.app.close(); }
+});
+
+test('a replacement hint retries, then supplies the author when the ordinary monitor sees voting', async () => {
+  const h = await harness();
+  const checked = [];
+  h.anime.fetchHtml = async (url, verify) => {
+    checked.push({ url, verify });
+    return checked.length === 1 ? '<html><body></body></html>' : '<html><body><div class="card-replacement" data-id="1" data-image="/new.png"></div><div class="card-replacement" data-id="2" data-image="/other.png"></div></body></html>';
+  };
+  try {
+    const signal = { method: 'POST', url: '/api/submission-hints', payload: { nick: 'Author', kind: 'replacement', cardId: '1' } };
+    assert.equal((await h.app.inject(signal)).statusCode, 202);
+    h.cancelSubmissionTimer();
+    assert.equal(await h.processSubmissionHint(), true);
+    assert.equal(await h.processSubmissionHint(), false);
+    assert.equal(h.runtime.tasks.size, 0);
+    h.time(NOW + 30000);
+    assert.equal(await h.processSubmissionHint(), true);
+    assert.deepEqual(checked, Array(2).fill({url:'https://animesss.tv/user/Author/cards_replacements/?status=pending',verify:true}));
+    assert.equal(h.verifiedReplacementHints.get('1|/new.png').author, 'Author');
+    assert.equal(h.verifiedReplacementHints.has('2|/other.png'), false);
+    assert.equal(h.runtime.tasks.size, 0);
+    h.anime.fetchHtml = async () => '<html><body><div class="card-replace-vote"><div class="anime-cards__item" data-id="1"><img src="/old.png"></div><div class="anime-cards__item" data-id="1"><img src="/new.png"></div></div></body></html>';
+    await h.monitorCardsPage();
+    await h.monitorCardsPage();
+    assert.equal(h.runtime.tasks.get('1|/new.png').author, 'Author');
+    assert.equal(h.runtime.authors.get('author').replacement_score, 1);
+  } finally { h.cancelSubmissionTimer(); await h.app.close(); }
+});
+
+test('malformed hints do not enqueue a scan, and the public queue has a hard admission limit', async () => {
+  const h = await harness();
+  try {
+    const submit = payload => h.app.inject({ method:'POST', url:'/api/submission-hints', payload });
+    assert.equal((await submit({ nick:'../Other', kind:'created' })).statusCode,400);
+    assert.equal((await submit({ nick:'Author', kind:'unknown' })).statusCode,400);
+    assert.equal(h.pendingSubmissionHints.size,0);
+    for(let i=0;i<12;i++) {
+      assert.equal((await submit({ nick:'Author '+i,kind:'created' })).statusCode,202);
+      h.cancelSubmissionTimer();
+    }
+    assert.equal((await submit({ nick:'Other',kind:'created' })).statusCode,429);
+    assert.equal(h.writes.length,0);
+  } finally { h.cancelSubmissionTimer(); await h.app.close(); }
 });
