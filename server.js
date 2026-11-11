@@ -330,7 +330,7 @@ class AnimeSSSClient {
     return cookie;
   }
 
-  async fetchFromOrigin(origin, path) {
+  async fetchFromOrigin(origin, path, verifyPage = false) {
     const cookie = await this.loginToOrigin(origin);
 
     await this.waitSlot();
@@ -347,20 +347,29 @@ class AnimeSSSClient {
 
     const html = await response.text();
     if (!response.ok) {
+      if (verifyPage && (response.status === 404 || response.status === 410)) return null;
       throw new Error(`HTTP ${response.status}`);
     }
     if (looksLikeLoginPage(html)) {
       this.cookieByOrigin.delete(origin);
       throw new Error('site returned login page after auth');
     }
+    if (verifyPage) {
+      const expected = new URL(path, origin);
+      const actual = new URL(response.url);
+      const normalize = pathname => decodeURIComponent(pathname).normalize('NFC').replace(/\/$/, '').toLocaleLowerCase('ru');
+      if (!this.origins.includes(actual.origin) || normalize(expected.pathname) !== normalize(actual.pathname) ||
+        [...expected.searchParams].some(([key, value]) => actual.searchParams.get(key) !== value)) return null;
+    }
     return html;
   }
 
-  fetchHtml(urlOrPath) {
+  fetchHtml(urlOrPath, verifyPage = false) {
     const operation = this.requestQueue.then(async () => {
       if (Date.now() < this.cooldownUntil) throw new Error('site cooldown active');
       try {
-        const html = await this.fetchHtmlInternal(urlOrPath);
+        const html = await this.fetchHtmlInternal(urlOrPath, verifyPage);
+        if (verifyPage && html === null) return null;
         if (!/<(?:html|body)\b/i.test(html) || /checking your browser|verify you are human|just a moment|captcha-container/i.test(html)) {
           throw new Error('unrecognized site page; not treated as an empty list');
         }
@@ -376,13 +385,13 @@ class AnimeSSSClient {
     return operation;
   }
 
-  async fetchHtmlInternal(urlOrPath) {
+  async fetchHtmlInternal(urlOrPath, verifyPage) {
     const path = this.pathFromUrl(urlOrPath);
     const errors = [];
 
     for (const origin of this.preferredOrigins(urlOrPath)) {
       try {
-        return await this.fetchFromOrigin(origin, path);
+        return await this.fetchFromOrigin(origin, path, verifyPage);
       } catch (error) {
         this.cookieByOrigin.delete(origin);
         errors.push(`${origin}${path}: ${error.message}`);
@@ -1191,6 +1200,109 @@ async function persistRuntimeState() {
 let tickRunning = false;
 let currentTickStep = 'idle';
 let lastTickStatus = { ok: true, running: false, message: 'not started', updatedAt: 0 };
+const pendingSubmissionHints = new Map();
+const recentSubmissionHints = new Map();
+const submissionAdmissions = [];
+const verifiedReplacementHints = new Map();
+const nextPriorityCheckAt = { created: 0, replacement: 0 };
+let submissionHintTimer = null;
+let submissionHintWakeAt = Infinity;
+
+function submissionHintDue(hint) {
+  const lane = hint.kind === 'created' ? 'nextSuggestionAt' : 'nextReplacementAt';
+  return Math.max(hint.retryAt, adaptive?.state[lane] || 0, nextPriorityCheckAt[hint.kind], anime.cooldownUntil || 0);
+}
+
+function scheduleSubmissionHints(minDelay = 0) {
+  if (!pendingSubmissionHints.size) return;
+  const now = nowMs();
+  const dueAt = Math.min(...[...pendingSubmissionHints.values()]
+    .map(hint => Math.min(submissionHintDue(hint), hint.expiresAt)));
+  const delay = Math.max(minDelay, dueAt - now, 0);
+  if (submissionHintTimer && submissionHintWakeAt <= now + delay) return;
+  clearTimeout(submissionHintTimer);
+  submissionHintWakeAt = now + delay;
+  submissionHintTimer = setTimeout(async () => {
+    submissionHintTimer = null;
+    submissionHintWakeAt = Infinity;
+    if (tickRunning) { scheduleSubmissionHints(500); return; }
+    tickRunning = true;
+    let delay = 0;
+    try {
+      await ensureRuntimeState();
+      await processSubmissionHint();
+    } catch (error) {
+      delay = 5000;
+      console.warn('[submission-hints]', error.message);
+    } finally {
+      tickRunning = false;
+      scheduleSubmissionHints(delay);
+    }
+  }, delay);
+  submissionHintTimer.unref();
+}
+
+function rememberVerifiedReplacement(key, author, at) {
+  const now = nowMs();
+  for (const [cachedKey, value] of verifiedReplacementHints) {
+    if (value.at + 2 * MINUTE <= now) verifiedReplacementHints.delete(cachedKey);
+  }
+  if (verifiedReplacementHints.size >= 256) verifiedReplacementHints.delete(verifiedReplacementHints.keys().next().value);
+  verifiedReplacementHints.set(key, { author, at });
+}
+
+async function applyReplacementHint(hint, page) {
+  let matched = false;
+  let remaining = 30;
+  for (const [cardId, images] of page.items) {
+    if (hint.cardId && hint.cardId !== cardId) continue;
+    for (const image of images) {
+      if (remaining-- <= 0) return matched;
+      matched = true;
+      const key = taskKey('replacement', cardId, image);
+      rememberVerifiedReplacement(key, hint.nick, page.at);
+      if (activeReplacementKeys.has(key)) await resolveReplacementAuthor(key, hint.nick);
+    }
+  }
+  return matched;
+}
+
+async function processSubmissionHint() {
+  const now = nowMs();
+  for (const [key, hint] of pendingSubmissionHints) {
+    if (hint.expiresAt <= now) pendingSubmissionHints.delete(key);
+  }
+  const next = [...pendingSubmissionHints].find(([, hint]) => submissionHintDue(hint) <= now);
+  if (!next) return false;
+  const [key, hint] = next;
+  const lane = hint.kind === 'created' ? 'suggestion' : 'replacement';
+  adaptive.reserve(lane, now);
+  // Leave every other request slot available to the normal scanner.
+  const nextLaneAt = adaptive.state[lane === 'suggestion' ? 'nextSuggestionAt' : 'nextReplacementAt'];
+  nextPriorityCheckAt[hint.kind] = now + 2 * (nextLaneAt - now);
+  hint.attempts++;
+  let matched = false;
+  try {
+    // The browser only supplies a hint. Read the profile with the scanner's session.
+    const page = await fetchAuthorList(hint.nick, lane, 0, true);
+    if (lane === 'replacement') {
+      matched = await applyReplacementHint(hint, page);
+    } else {
+      const author = authorKey(hint.nick);
+      const cards = page.items.filter(card => {
+        const existing = runtime.suggestions.get(String(card.cardId));
+        return (!card.author || authorKey(card.author) === author) && (!existing?.author || authorKey(existing.author) === author);
+      });
+      matched = cards.some(card => !runtime.suggestions.get(String(card.cardId))?.active);
+      if (cards.length) await applyAuthorSuggestions(hint.nick, cards, page.at, false);
+    }
+  } catch (error) {
+    console.warn('[submission-hints]', error.message);
+  }
+  if (matched || hint.attempts >= 2) pendingSubmissionHints.delete(key);
+  else hint.retryAt = nowMs() + 5000;
+  return true;
+}
 
 async function timedStep(timings, name, fn) {
   const startedAt = nowMs();
@@ -1212,12 +1324,13 @@ async function runTick({ budgetMs = config.tickBudgetMs } = {}) {
   lastTickStatus = { ok: true, running: true, startedAt, updatedAt: startedAt };
   try {
     await ensureRuntimeState();
+    if (pendingSubmissionHints.size) await timedStep(timings, 'submission-hint', processSubmissionHint);
     if (nowMs() >= anime.cooldownUntil && nowMs() - lastCatalogMonitorAt >= config.cardsMonitorIntervalMs) {
       stats.cardsMonitor = await timedStep(timings, 'monitorCardsPage', monitorCardsPage);
     }
     while (nowMs() - startedAt < budgetMs && nowMs() >= anime.cooldownUntil) {
       // Each queue gets a turn: pending replacements can no longer suppress suggestions.
-      let worked = false;
+      let worked = pendingSubmissionHints.size > 0 && await timedStep(timings, 'submission-hint', processSubmissionHint);
       if (nowMs() - startedAt < budgetMs) {
         const count = await timedStep(timings, 'suggestions', () => processSuggestionAuthors(1));
         stats.suggestionAuthors += count;
@@ -1239,7 +1352,7 @@ async function runTick({ budgetMs = config.tickBudgetMs } = {}) {
     await logEvent('error', 'tick', error.message);
     lastTickStatus = { ok: false, running: false, step: currentTickStep, error: error.message, ...stats, updatedAt: nowMs() };
     return lastTickStatus;
-  } finally { tickRunning = false; currentTickStep = 'idle'; }
+  } finally { tickRunning = false; currentTickStep = 'idle'; scheduleSubmissionHints(); }
 }
 
 async function monitorCardsPage() {
@@ -1271,7 +1384,9 @@ async function monitorCardsPage() {
   }
 
   for (const replacement of parsed.replacements) {
-    await upsertTask('replacement', replacement);
+    const key = await upsertTask('replacement', replacement);
+    const verified = verifiedReplacementHints.get(key);
+    if (verified && verified.at + 2 * MINUTE > nowMs()) await resolveReplacementAuthor(key, verified.author);
   }
   const visibleReplacementKeys = parsed.replacements.map(replacement =>
     taskKey('replacement', replacement.cardId, replacement.newImage || replacement.image || '')
@@ -1307,20 +1422,29 @@ function epochFor(task) {
   return adaptive.state.taskEpoch[task.task_key] || Number(task.created_at) || 0;
 }
 
-async function fetchAuthorList(author, kind, notOlderThan = 0) {
+async function fetchAuthorList(author, kind, notOlderThan = 0, verifyPage = false) {
   const key = kind + ':' + authorKey(author);
   const cached = authorPageCache.get(key);
-  if (cached && cached.at >= notOlderThan && cached.at + 2 * MINUTE > nowMs()) return cached;
+  if (!verifyPage && cached && cached.at >= notOlderThan && cached.at + 2 * MINUTE > nowMs()) return cached;
   const html = await anime.fetchHtml(kind === 'replacement'
-    ? anime.replacementPendingUrl(author) : anime.createdModerationUrl(author));
+    ? anime.replacementPendingUrl(author) : anime.createdModerationUrl(author), verifyPage);
   const items = kind === 'replacement' ? parseReplacementPage(html, anime.baseUrl)
     : parseCreatedModerationCards(html, anime.baseUrl, author);
   const page = { at: nowMs(), items };
-  authorPageCache.set(key, page);
+  // A submission hint only confirms items that are present. Keep an early or
+  // empty snapshot out of the cache used by the ordinary coverage scan.
+  if (!verifyPage && html !== null) authorPageCache.set(key, page);
   for (const [key, value] of authorPageCache) {
     if (value.at + 2 * MINUTE < nowMs() || authorPageCache.size > 128) authorPageCache.delete(key);
   }
   return page;
+}
+
+async function resolveReplacementAuthor(key, author) {
+  const task = runtime.tasks.get(key);
+  if (!task || task.status === 'found') return;
+  await updateTask(key, { status: 'found', author });
+  await bumpAuthorScore(author, 'replacement', 1);
 }
 
 async function processOneAuthorshipTask() {
@@ -1377,8 +1501,7 @@ async function processOneAuthorshipTask() {
         if (count) await upsertAuthor(chosen.row.name, { inactive: 0 });
         for (const task of tasks) {
           if (page.items.get(String(task.card_id))?.has(imagePath(anime.baseUrl, task.image))) {
-            await updateTask(task.task_key, { status: 'found', author: chosen.row.name });
-            await bumpAuthorScore(chosen.row.name, 'replacement', 1);
+            await resolveReplacementAuthor(task.task_key, chosen.row.name);
           }
         }
         adaptive.success(key, 'replacement', page.at);
@@ -1425,7 +1548,7 @@ async function checkAuthorSuggestions(authorName) {
   await applyAuthorSuggestions(authorName, page.items, page.at);
 }
 
-async function applyAuthorSuggestions(authorName, cards, fetchedAt) {
+async function applyAuthorSuggestions(authorName, cards, fetchedAt, updateCoverage = true) {
   const key = authorKey(authorName);
   const activeIds = [];
   let newCount = 0;
@@ -1442,10 +1565,11 @@ async function applyAuthorSuggestions(authorName, cards, fetchedAt) {
     }
     if (isNew) newCount++;
   }
-  await deactivateMissingSuggestions(authorName, activeIds);
+  if (updateCoverage) await deactivateMissingSuggestions(authorName, activeIds);
   await upsertAuthor(authorName, { lastSuggestionCheckedAt: fetchedAt,
     ...(newCount ? { inactive: 0, lastSuggestionFoundAt: fetchedAt } : {}) });
   if (newCount) await bumpAuthorScore(authorName, 'suggestion', newCount);
+  if (!updateCoverage) return;
   adaptive.state.createdCoverage[key] = fetchedAt;
   const plan = adaptive.plan([...runtime.authors.values()], nowMs()).planned.find(x => x.row.author_key === key);
   adaptive.success(key, 'suggestion', fetchedAt, plan?.interval || MAX_INTERVAL);
@@ -1521,6 +1645,38 @@ app.get('/health', async () => ({
   service: 'anime-cards-server',
   runtimeCache: runtimeStats()
 }));
+
+app.post('/api/submission-hints', { bodyLimit: 2048, schema: { body: {
+  type: 'object', required: ['nick', 'kind'], additionalProperties: false,
+  properties: {
+    nick: { type: 'string', minLength: 1, maxLength: 80 },
+    kind: { type: 'string', enum: ['created', 'replacement'] },
+    cardId: { type: 'string', pattern: '^[1-9][0-9]{0,15}$' }
+  }
+} } }, async (request, reply) => {
+  const { kind, cardId } = request.body;
+  const nick = request.body.nick.trim().normalize('NFC');
+  if (!nick || nick === '.' || nick === '..' || /[\/\\\x00-\x1f\x7f]/u.test(nick) || (kind === 'created' && cardId)) {
+    return reply.code(400).send({ ok: false, error: 'invalid submission hint' });
+  }
+  const now = nowMs();
+  const key = JSON.stringify([kind, authorKey(nick), cardId || '']);
+  for (const [oldKey, acceptedAt] of recentSubmissionHints) {
+    if (acceptedAt + 5000 <= now) recentSubmissionHints.delete(oldKey);
+  }
+  if (pendingSubmissionHints.has(key) || recentSubmissionHints.has(key)) {
+    return reply.code(202).send({ ok: true, duplicate: true });
+  }
+  while (submissionAdmissions.length && submissionAdmissions[0] + MINUTE <= now) submissionAdmissions.shift();
+  if (submissionAdmissions.length >= 12 || pendingSubmissionHints.size >= 24) {
+    return reply.header('Retry-After', '60').code(429).send({ ok: false, error: 'submission queue full' });
+  }
+  submissionAdmissions.push(now);
+  recentSubmissionHints.set(key, now);
+  pendingSubmissionHints.set(key, { kind, nick, cardId, retryAt: now, attempts: 0, expiresAt: now + 2 * MINUTE });
+  scheduleSubmissionHints();
+  return reply.code(202).send({ ok: true, queued: true });
+});
 
 app.get('/api/tick', async request => {
   const budgetMs = Number(request.query?.budgetMs || config.tickBudgetMs);
