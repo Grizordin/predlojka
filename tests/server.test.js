@@ -30,8 +30,8 @@ async function harness(rows = [makeRow('Author')]) {
       pendingSubmissionHints, verifiedReplacementHints, processSubmissionHint,
       cancelSubmissionTimer() { clearTimeout(submissionHintTimer); submissionHintTimer = null; submissionHintWakeAt = Infinity; },
       get scheduler() { return adaptive; },
-      setup(rows) {
-        hydrateRuntime(rows, [], [], [], [], []);
+      setup(rows, cards) {
+        hydrateRuntime(rows, cards, [], [], [], []);
         adaptive = new AdaptiveScheduler(rows, null, nowMs());
         adaptive.state.createdCoverage = {}; adaptive.state.taskEpoch = {};
         adaptive.state.sweepRetry = {};
@@ -48,7 +48,7 @@ async function harness(rows = [makeRow('Author')]) {
     scheduling.AdaptiveScheduler, scheduling.activityScore, scheduling.MAX_INTERVAL,
     scheduling.MINUTE, scheduling.HOUR, scheduling.DAY, Clock,
     { env: { ADMIN_TOKEN: 'test-token' } }, () => { throw new Error('Live network forbidden in tests'); });
-  h.setup(rows);
+  h.setup(rows, []);
   h.writes = [];
   h.d1.query = async (sql, params = []) => { h.writes.push({ sql, params }); return []; };
   h.time = value => { now = value; };
@@ -101,6 +101,36 @@ test('single replacement page resolves multiple tasks with one request', async (
   assert.equal(h.runtime.tasks.get(a.task_key).status, 'found');
   assert.equal(h.runtime.tasks.get(b.task_key).status, 'found');
   assert.equal(h.runtime.authors.get('author').replacement_score, 2);
+  await h.app.close();
+});
+
+test('replacement sweep prefers ten published cards or prior replacements, then finds an author with no count', async () => {
+  const rows = [makeRow('Alpha'), makeRow('Beta', { created_count: 9 }),
+    makeRow('Charlie', { created_count: 10 }), makeRow('Delta', { replacement_score: 1 }),
+    makeRow('Echo')];
+  const h = await harness(rows);
+  h.setup(rows, Array.from({ length: 10 }, (_, index) => ({
+    card_id: String(index + 10), author: 'ECHO', first_seen_source: 'catalog'
+  })));
+  const a = task('1|/new.png', 'replacement');
+  h.runtime.tasks.set(a.task_key, a);
+  h.setVisible('replacement', [a.task_key]);
+  const requests = [];
+  h.anime.fetchHtml = async url => {
+    const name = new URL(url).pathname.split('/')[2];
+    requests.push(name);
+    const item = name === 'Alpha' ? '<div class="card-replacement" data-id="1" data-image="/new.png"></div>' : '';
+    return '<html><body>' + item + '</body></html>';
+  };
+  for (let index = 0; index < 4; index++) {
+    h.time(NOW + index * 60_000);
+    assert.equal(await h.processOneAuthorshipTask(), true);
+  }
+  assert.equal(h.config.replacementMinCreatedCards, 10);
+  assert.deepEqual(requests.slice(0, 3).sort(), ['Charlie', 'Delta', 'Echo']);
+  assert.equal(requests[3], 'Alpha');
+  assert.equal(h.runtime.tasks.get(a.task_key).status, 'found');
+  assert.equal(h.runtime.tasks.get(a.task_key).author, 'Alpha');
   await h.app.close();
 });
 
