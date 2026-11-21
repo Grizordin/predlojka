@@ -32,6 +32,7 @@ const config = {
   tickBudgetMs: Math.min(45000, Math.max(5000, Number(process.env.TICK_BUDGET_MS || 35000))),
   suggestionRequestsPerHour: Math.max(1, Number(process.env.SUGGESTION_REQUESTS_PER_HOUR || 600)),
   replacementRequestsPerHour: Math.max(1, Number(process.env.REPLACEMENT_REQUESTS_PER_HOUR || 300)),
+  replacementMinCreatedCards: Math.max(0, Math.floor(numberValue(process.env.REPLACEMENT_MIN_CREATED_CARDS || 10, 10))),
   cardsMonitorIntervalMs: Number(process.env.CARDS_MONITOR_INTERVAL_MS || 60000),
   inactiveScanIntervalMs: Number(process.env.INACTIVE_SCAN_INTERVAL_MS || 86400000),
   suggestionRatedIntervalMs: Number(process.env.SUGGESTION_RATED_INTERVAL_MS || 600000),
@@ -586,6 +587,7 @@ let lastCatalogMonitorAt = 0;
 let activeCreatedKeys = new Set();
 let activeReplacementKeys = new Set();
 const authorPageCache = new Map(); // Bounded, short-lived parsed lists; never raw HTML.
+let catalogCreatedCounts = null;
 const runtime = {
   loaded: false,
   loading: null,
@@ -651,6 +653,7 @@ function addSuggestionToAuthorIndex(row) {
 function hydrateRuntime(authors, cards, suggestions, tasks, checkpointRows, logs) {
   runtime.authors.clear();
   runtime.cards.clear();
+  catalogCreatedCounts = null;
   runtime.suggestions.clear();
   runtime.suggestionsByAuthor.clear();
   runtime.tasks.clear();
@@ -938,6 +941,10 @@ async function upsertCard(card, source, author = card.author || null) {
     ]
   );
   runtime.cards.set(cardId, row);
+  if (row.first_seen_source === 'catalog' &&
+      (current?.first_seen_source !== 'catalog' || current.author !== row.author)) {
+    catalogCreatedCounts = null;
+  }
   return true;
 }
 
@@ -1447,6 +1454,18 @@ async function resolveReplacementAuthor(key, author) {
   await bumpAuthorScore(author, 'replacement', 1);
 }
 
+function getCatalogCreatedCounts() {
+  if (!catalogCreatedCounts) {
+    catalogCreatedCounts = new Map();
+    for (const card of runtime.cards.values()) {
+      if (card.first_seen_source !== 'catalog' || !card.author) continue;
+      const key = authorKey(card.author);
+      catalogCreatedCounts.set(key, (catalogCreatedCounts.get(key) || 0) + 1);
+    }
+  }
+  return catalogCreatedCounts;
+}
+
 async function processOneAuthorshipTask() {
   const now = nowMs();
   if (now < adaptive.state.nextReplacementAt) return false;
@@ -1464,6 +1483,8 @@ async function processOneAuthorshipTask() {
       }
     }
     const oldest = Math.min(...tasks.map(epochFor));
+    const minimum = type === 'replacement' ? config.replacementMinCreatedCards : 0;
+    const catalogCounts = minimum > 0 ? getCatalogCreatedCounts() : null;
     const candidates = [...runtime.authors.values()].map(row => {
       const entry = adaptive.addAuthor(row.author_key, now);
       const lane = entry.replacement;
@@ -1471,13 +1492,16 @@ async function processOneAuthorshipTask() {
       const retry = adaptive.state.sweepRetry[type + ':' + row.author_key] || 0;
       const score = type === 'replacement' ? activityScore(lane, now, adaptive.state.startedAt)
         : Math.max(0, Number(row.created_score) || 0);
-      return { row, lane, coveredAt, retry, score };
+      const preferred = minimum === 0 || numberValue(row.replacement_score) > 0 ||
+        numberValue(row.created_count) >= minimum || (catalogCounts.get(row.author_key) || 0) >= minimum;
+      return { row, coveredAt, retry, score, preferred };
     });
     const eligible = candidates.filter(x => x.coveredAt < oldest && x.retry <= now)
       .sort((a, b) => {
         const urgentA = now - oldest >= MAX_INTERVAL;
         // Once a sweep is overdue, visit least recently checked authors first.
-        return (urgentA ? a.coveredAt - b.coveredAt : b.score - a.score)
+        return Number(b.preferred) - Number(a.preferred)
+          || (urgentA ? a.coveredAt - b.coveredAt : b.score - a.score)
           || a.coveredAt - b.coveredAt || a.row.author_key.localeCompare(b.row.author_key);
       });
     const chosen = eligible[0];
