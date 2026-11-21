@@ -436,9 +436,10 @@ function parseCreatedCount(html) {
   const $ = cheerio.load(html || '');
   const text = $('.ncard__main-title, h1').toArray()
     .map(node => $(node).text())
-    .find(value => /Карточки\s+созданные\s+пользователем|РљР°СЂС‚РѕС‡РєРё\s+СЃРѕР·РґР°РЅРЅС‹Рµ/i.test(value)) || $.text();
-  const match = String(text || '').match(/\(([\d\s]+)\s*(?:шт\.|С€С‚\.)\)/i);
-  return match ? Number(match[1].replace(/\s+/g, '')) : 0;
+    .find(value => /Карточки\s+созданные\s+пользователем|РљР°СЂС‚РѕС‡РєРё\s+СЃРѕР·РґР°РЅРЅС‹Рµ/i.test(value));
+  const match = text?.match(/\(\s*(\d[\d\s]*)\s*(?:шт\.|С€С‚\.)\)\s*$/i);
+  const count = match ? Number(match[1].replace(/\s+/g, '')) : null;
+  return Number.isSafeInteger(count) ? count : null;
 }
 
 function parseProfileOnlineText(html) {
@@ -1373,8 +1374,10 @@ async function monitorCardsPage() {
     const key = authorKey(card.author);
     const knownCard = runtime.cards.has(String(card.cardId));
     const firstObservedPublication = adaptive.catalogIsNew(card.cardId);
-    adaptive.addAuthor(key, nowMs());
+    const entry = adaptive.addAuthor(key, nowMs());
     if (firstObservedPublication) {
+      const sample = entry.replacement.createdCardCount;
+      if ((sample?.count ?? Infinity) < config.replacementMinCreatedCards) sample.checkedAt = 0;
       // Existing moderation -> publication is a wake-up signal, not a second activity point.
       if (!knownCard) adaptive.observe(key, 'suggestion', [card.cardId], nowMs());
       adaptive.wake(key, nowMs());
@@ -1485,17 +1488,24 @@ async function processOneAuthorshipTask() {
     const oldest = Math.min(...tasks.map(epochFor));
     const minimum = type === 'replacement' ? config.replacementMinCreatedCards : 0;
     const catalogCounts = minimum > 0 ? getCatalogCreatedCounts() : null;
-    const candidates = [...runtime.authors.values()].map(row => {
-      const entry = adaptive.addAuthor(row.author_key, now);
-      const lane = entry.replacement;
+    const candidates = [];
+    for (const row of runtime.authors.values()) {
+      const lane = adaptive.addAuthor(row.author_key, now).replacement;
+      const sample = lane.createdCardCount;
+      const countIsFresh = (sample?.checkedAt || 0) > now - DAY;
+      const belowMinimum = (sample?.count ?? Infinity) < minimum;
+      if (belowMinimum && countIsFresh) continue;
       const coveredAt = type === 'replacement' ? lane.lastSuccess : (adaptive.state.createdCoverage[row.author_key] || 0);
       const retry = adaptive.state.sweepRetry[type + ':' + row.author_key] || 0;
       const score = type === 'replacement' ? activityScore(lane, now, adaptive.state.startedAt)
         : Math.max(0, Number(row.created_score) || 0);
       const preferred = minimum === 0 || numberValue(row.replacement_score) > 0 ||
-        numberValue(row.created_count) >= minimum || (catalogCounts.get(row.author_key) || 0) >= minimum;
-      return { row, coveredAt, retry, score, preferred };
-    });
+        (sample?.count ?? numberValue(row.created_count)) >= minimum ||
+        (catalogCounts.get(row.author_key) || 0) >= minimum;
+      const storedBelowMinimum = row.created_count != null && numberValue(row.created_count, minimum) < minimum;
+      const needsCreatedCount = minimum > 0 && !countIsFresh && (belowMinimum || !preferred || storedBelowMinimum);
+      candidates.push({ row, lane, coveredAt, retry, score, preferred, needsCreatedCount });
+    }
     const eligible = candidates.filter(x => x.coveredAt < oldest && x.retry <= now)
       .sort((a, b) => {
         const urgentA = now - oldest >= MAX_INTERVAL;
@@ -1506,7 +1516,7 @@ async function processOneAuthorshipTask() {
       });
     const chosen = eligible[0];
     if (!chosen) {
-      if (candidates.length && candidates.every(x => x.coveredAt >= oldest)) {
+      if (runtime.authors.size && candidates.every(x => x.coveredAt >= oldest)) {
         const coveredThrough = Math.min(...candidates.map(x => x.coveredAt));
         for (const task of tasks.filter(task => epochFor(task) <= coveredThrough)) {
           await updateTask(task.task_key, { status: 'not_found' });
@@ -1518,8 +1528,12 @@ async function processOneAuthorshipTask() {
     adaptive.state.lastAuthorshipKind = type;
     const key = chosen.row.author_key;
     try {
-      const page = await fetchAuthorList(chosen.row.name, type === 'replacement' ? 'replacement' : 'suggestion', oldest);
-      if (type === 'replacement') {
+      if (chosen.needsCreatedCount) {
+        const html = await anime.fetchHtml(anime.createdCountUrl(chosen.row.name), true);
+        // The next request still needs its own slot. A count never records replacement coverage.
+        chosen.lane.createdCardCount = { count: parseCreatedCount(html), checkedAt: nowMs() };
+      } else if (type === 'replacement') {
+        const page = await fetchAuthorList(chosen.row.name, 'replacement', oldest);
         const uniqueReplacements = [...page.items].flatMap(([id, images]) => [...images].map(image => taskKey('replacement', id, image)));
         const count = adaptive.observe(key, 'replacement', uniqueReplacements, nowMs());
         if (count) await upsertAuthor(chosen.row.name, { inactive: 0 });
@@ -1531,6 +1545,7 @@ async function processOneAuthorshipTask() {
         adaptive.success(key, 'replacement', page.at);
       } else {
         // The same moderation fetch also updates suggestions; no second network request.
+        const page = await fetchAuthorList(chosen.row.name, 'suggestion', oldest);
         await applyAuthorSuggestions(chosen.row.name, page.items, page.at);
       }
       delete adaptive.state.sweepRetry[type + ':' + key];
