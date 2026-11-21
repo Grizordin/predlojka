@@ -14,7 +14,7 @@ const makeRow = (name, extra = {}) => ({ author_key: name.toLowerCase(), name,
   suggestion_score: 0, created_score: 0, replacement_score: 0, inactive: 0,
   last_suggestion_checked_at: 0, last_suggestion_found_at: 0, updated_at: NOW, ...extra });
 
-async function harness(rows = [makeRow('Author')]) {
+async function harness(rows = [makeRow('Author', { created_count: 10 })]) {
   let now = NOW;
   class Clock extends Date { static now() { return now; } }
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
@@ -104,7 +104,7 @@ test('single replacement page resolves multiple tasks with one request', async (
   await h.app.close();
 });
 
-test('replacement sweep prefers ten published cards or prior replacements, then finds an author with no count', async () => {
+test('replacement sweep skips a confirmed count of nine and accepts ten', async () => {
   const rows = [makeRow('Alpha'), makeRow('Beta', { created_count: 9 }),
     makeRow('Charlie', { created_count: 10 }), makeRow('Delta', { replacement_score: 1 }),
     makeRow('Echo')];
@@ -117,20 +117,81 @@ test('replacement sweep prefers ten published cards or prior replacements, then 
   h.setVisible('replacement', [a.task_key]);
   const requests = [];
   h.anime.fetchHtml = async url => {
-    const name = new URL(url).pathname.split('/')[2];
-    requests.push(name);
-    const item = name === 'Alpha' ? '<div class="card-replacement" data-id="1" data-image="/new.png"></div>' : '';
+    const [, , name, page] = new URL(url).pathname.split('/');
+    requests.push([name, page]);
+    if (page === 'cards_created') return createdCountPage(name === 'Alpha' ? 9 : 10);
+    const item = name === 'Beta' ? '<div class="card-replacement" data-id="1" data-image="/new.png"></div>' : '';
     return '<html><body>' + item + '</body></html>';
   };
-  for (let index = 0; index < 4; index++) {
-    h.time(NOW + index * 60_000);
+  for (let index = 0; index < 6; index++) {
+    h.time(NOW + index * 20_000);
     assert.equal(await h.processOneAuthorshipTask(), true);
   }
   assert.equal(h.config.replacementMinCreatedCards, 10);
-  assert.deepEqual(requests.slice(0, 3).sort(), ['Charlie', 'Delta', 'Echo']);
-  assert.equal(requests[3], 'Alpha');
+  assert.deepEqual(requests.slice(0, 3).sort(), [
+    ['Charlie', 'cards_replacements'], ['Delta', 'cards_replacements'], ['Echo', 'cards_replacements']
+  ]);
+  assert.deepEqual(requests.slice(3), [
+    ['Alpha', 'cards_created'], ['Beta', 'cards_created'], ['Beta', 'cards_replacements']
+  ]);
+  assert.equal(h.scheduler.state.authors.alpha.replacement.lastSuccess, 0, 'count lookup does not record replacement coverage');
   assert.equal(h.runtime.tasks.get(a.task_key).status, 'found');
-  assert.equal(h.runtime.tasks.get(a.task_key).author, 'Alpha');
+  assert.equal(h.runtime.tasks.get(a.task_key).author, 'Beta');
+  await h.app.close();
+});
+
+function createdCountPage(count) {
+  return '<html><body><h1 class="ncard__main-title">Карточки созданные пользователем <a>Author</a> <span>('
+    + count + ' шт.)</span></h1></body></html>';
+}
+
+test('the replacement pool refreshes a low count after the author publishes another card', async () => {
+  const h = await harness([makeRow('Author', { replacement_score: 1 })]);
+  const a = task('1|/new.png', 'replacement');
+  h.runtime.tasks.set(a.task_key, a);
+  h.setVisible('replacement', [a.task_key]);
+  h.scheduler.state.authors.author.replacement.createdCardCount = { count: 9, checkedAt: NOW };
+  let requests = 0;
+  h.anime.fetchHtml = async () => { requests++; throw new Error('Unexpected request'); };
+  assert.equal(await h.processOneAuthorshipTask(), false);
+  assert.equal(requests, 0);
+  assert.equal(h.runtime.tasks.get(a.task_key).status, 'not_found');
+  h.time(NOW + scheduling.MAX_INTERVAL + 1);
+  const requested = [];
+  h.anime.fetchHtml = async url => {
+    const page = new URL(url).pathname;
+    requested.push(page);
+    if (page.endsWith('/cards_created/')) return createdCountPage(10);
+    return '<html><body><div class="anime-cards__item" data-id="123" data-author="Author"><img src="/123.png"></div></body></html>';
+  };
+  await h.monitorCardsPage();
+  h.setVisible('replacement', [a.task_key]);
+  assert.equal(await h.processOneAuthorshipTask(), true);
+  assert.ok(requested[1].endsWith('/cards_created/'));
+  assert.equal(h.scheduler.state.authors.author.replacement.createdCardCount.count, 10);
+  await h.app.close();
+});
+
+test('missing or unrelated counts do not exclude a possible replacement author', async () => {
+  const h = await harness([makeRow('Author')]);
+  const a = task('1|/new.png', 'replacement');
+  h.runtime.tasks.set(a.task_key, a);
+  h.setVisible('replacement', [a.task_key]);
+  const requested = [];
+  h.anime.fetchHtml = async url => {
+    const page = new URL(url).pathname;
+    requested.push(page);
+    if (page.endsWith('/cards_created/')) return '<html><body><h1>Карточки созданные пользователем Author ( шт.)</h1><h1>Уведомления (2 шт.)</h1></body></html>';
+    return '<html><body><div class="card-replacement" data-id="1" data-image="/new.png"></div></body></html>';
+  };
+  await h.processOneAuthorshipTask();
+  assert.equal(h.scheduler.state.authors.author.replacement.createdCardCount.count, null);
+  assert.equal(h.runtime.tasks.get(a.task_key).status, 'pending');
+  assert.equal(await h.processOneAuthorshipTask(), false, 'a second request must wait for the shared budget');
+  h.time(NOW + 20_000);
+  await h.processOneAuthorshipTask();
+  assert.equal(requested.length, 2);
+  assert.equal(h.runtime.tasks.get(a.task_key).status, 'found');
   await h.app.close();
 });
 
